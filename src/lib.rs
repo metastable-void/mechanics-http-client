@@ -54,6 +54,9 @@ mod request;
 mod response;
 mod tls;
 
+#[cfg(test)]
+mod tests;
+
 pub use client::{Client, ClientBuilder};
 pub use error::{Error, Result};
 pub use request::RequestBuilder;
