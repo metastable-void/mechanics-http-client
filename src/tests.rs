@@ -155,8 +155,8 @@ fn alt_svc_parser_clear_evicts() {
 #[cfg(feature = "http3")]
 #[test]
 fn https_rr_parser_honours_h3_port_and_hints() {
-    use hickory_resolver::proto::rr::rdata::svcb::{Alpn, IpHint, SvcParamKey, SvcParamValue};
-    use hickory_resolver::proto::rr::rdata::{A, AAAA};
+    use hickory_resolver::net::proto::rr::rdata::svcb::{Alpn, IpHint, SvcParamKey, SvcParamValue};
+    use hickory_resolver::net::proto::rr::rdata::{A, AAAA};
 
     let expires_at = std::time::Instant::now() + Duration::from_secs(60);
     let entry = https_rr::parse_svcb(

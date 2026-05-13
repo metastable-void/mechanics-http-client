@@ -5,8 +5,8 @@ use std::net::IpAddr;
 use std::time::Instant;
 
 use hickory_resolver::TokioResolver;
-use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
-use hickory_resolver::proto::rr::{RData, RecordType};
+use hickory_resolver::net::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
+use hickory_resolver::net::proto::rr::{RData, RecordType};
 
 use crate::client::Origin;
 use crate::error::{Error, Result};
@@ -34,7 +34,8 @@ pub(crate) fn fresh(entry: &HttpsRrEntry, now: Instant) -> bool {
 pub(crate) async fn lookup(origin: &Origin) -> Result<Option<HttpsRrEntry>> {
     let resolver = TokioResolver::builder_tokio()
         .map_err(|e| Error::Dns(e.to_string()))?
-        .build();
+        .build()
+        .map_err(|e| Error::Dns(e.to_string()))?;
     let lookup = resolver
         .lookup(origin.host.as_str(), RecordType::HTTPS)
         .await
@@ -42,11 +43,12 @@ pub(crate) async fn lookup(origin: &Origin) -> Result<Option<HttpsRrEntry>> {
 
     let expires_at = lookup.valid_until();
     let mut best = None;
-    for record in lookup.iter() {
+    for record in lookup.answers() {
+        let record = &record.data;
         let RData::HTTPS(https) = record else {
             continue;
         };
-        let parsed = parse_svcb(https.0.svc_params(), origin.port, expires_at);
+        let parsed = parse_svcb(&https.0.svc_params, origin.port, expires_at);
         if parsed.has_h3 {
             return Ok(Some(parsed));
         }
