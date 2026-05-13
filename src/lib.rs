@@ -68,7 +68,7 @@
 //! - Multipart form bodies, cookies, proxies, redirect-following
 //!   knobs.
 //! - Streaming `chunk()`-style response iteration.
-//! - HTTP/3.
+//! - Server-side HTTP/3.
 //!
 //! # TLS posture (load-bearing)
 //!
@@ -83,9 +83,15 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
+#[cfg(feature = "http3")]
+mod alt_svc;
 mod body;
 mod client;
 mod error;
+#[cfg(feature = "http3")]
+mod http3;
+#[cfg(feature = "http3")]
+mod https_rr;
 mod request;
 mod response;
 mod tls;

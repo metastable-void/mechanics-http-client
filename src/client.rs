@@ -1,9 +1,11 @@
 //! [`Client`] / [`ClientBuilder`]: connection-pool-managed HTTPS
-//! client. ALPN negotiates HTTP/1.1 or HTTP/2; TLS uses the
-//! workspace-locked posture (bundled `webpki-roots` + `aws-lc-rs`).
+//! client. ALPN negotiates HTTP/1.1 or HTTP/2 on TCP/TLS, and
+//! HTTP/3 is attempted opportunistically over QUIC when enabled.
 
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "http3")]
+use std::{collections::HashMap, sync::RwLock, time::Instant};
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
@@ -15,6 +17,8 @@ use crate::body::RequestBody;
 use crate::error::{Error, Result};
 use crate::request::RequestBuilder;
 use crate::tls;
+#[cfg(feature = "http3")]
+use crate::{alt_svc, http3, https_rr};
 
 /// Type alias for the hyper-util client backing each [`Client`].
 pub(crate) type HyperClient = HyperLegacyClient<HttpsConnector<HttpConnector>, RequestBody>;
@@ -41,6 +45,26 @@ pub(crate) struct ClientInner {
     pub(crate) hyper: HyperClient,
     pub(crate) default_timeout: Option<Duration>,
     pub(crate) default_headers: HeaderMap,
+    #[cfg(feature = "http3")]
+    pub(crate) http3_enabled: bool,
+    #[cfg(feature = "http3")]
+    pub(crate) http3_negative_cache_duration: Duration,
+    #[cfg(feature = "http3")]
+    pub(crate) https_rr_cache: Arc<RwLock<https_rr::HttpsRrCache>>,
+    #[cfg(feature = "http3")]
+    pub(crate) alt_svc_cache: Arc<RwLock<alt_svc::AltSvcCache>>,
+    #[cfg(feature = "http3")]
+    pub(crate) negative_cache: Arc<RwLock<HashMap<Origin, Instant>>>,
+    #[cfg(feature = "http3")]
+    pub(crate) http3: Arc<http3::Http3State>,
+}
+
+/// Scheme/authority tuple used as a cache key for per-origin transport state.
+#[cfg(feature = "http3")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct Origin {
+    pub(crate) host: String,
+    pub(crate) port: u16,
 }
 
 impl Client {
@@ -88,10 +112,57 @@ impl Client {
     pub fn request(&self, method: Method, url: impl AsRef<str>) -> RequestBuilder {
         RequestBuilder::new(self.clone(), method, url.as_ref())
     }
+
+    #[cfg(all(feature = "http3", test))]
+    pub(crate) fn insert_https_rr_for_test(&self, origin: Origin, entry: https_rr::HttpsRrEntry) {
+        if let Ok(mut cache) = self.inner.https_rr_cache.write() {
+            cache.insert(origin, entry);
+        }
+    }
+
+    #[cfg(all(feature = "http3", test))]
+    pub(crate) fn insert_alt_svc_for_test(&self, origin: Origin, entry: alt_svc::AltSvcEntry) {
+        if let Ok(mut cache) = self.inner.alt_svc_cache.write() {
+            cache.insert(origin, entry);
+        }
+    }
+
+    #[cfg(all(feature = "http3", test))]
+    pub(crate) fn insert_negative_for_test(&self, origin: Origin, expires_at: Instant) {
+        if let Ok(mut cache) = self.inner.negative_cache.write() {
+            cache.insert(origin, expires_at);
+        }
+    }
+
+    #[cfg(all(feature = "http3", test))]
+    pub(crate) fn has_https_rr_for_test(&self, origin: &Origin) -> bool {
+        self.inner
+            .https_rr_cache
+            .read()
+            .map(|cache| cache.contains_key(origin))
+            .unwrap_or(false)
+    }
+
+    #[cfg(all(feature = "http3", test))]
+    pub(crate) fn has_alt_svc_for_test(&self, origin: &Origin) -> bool {
+        self.inner
+            .alt_svc_cache
+            .read()
+            .map(|cache| cache.contains_key(origin))
+            .unwrap_or(false)
+    }
+
+    #[cfg(all(feature = "http3", test))]
+    pub(crate) fn has_negative_for_test(&self, origin: &Origin) -> bool {
+        self.inner
+            .negative_cache
+            .read()
+            .map(|cache| cache.contains_key(origin))
+            .unwrap_or(false)
+    }
 }
 
 /// Builder for [`Client`].
-#[derive(Default)]
 pub struct ClientBuilder {
     timeout: Option<Duration>,
     pool_max_idle_per_host: Option<usize>,
@@ -99,6 +170,27 @@ pub struct ClientBuilder {
     default_headers: HeaderMap,
     user_agent: Option<HeaderValue>,
     invalid_default_header: Option<Error>,
+    #[cfg(feature = "http3")]
+    http3_enabled: bool,
+    #[cfg(feature = "http3")]
+    http3_negative_cache_duration: Option<Duration>,
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        Self {
+            timeout: None,
+            pool_max_idle_per_host: None,
+            pool_idle_timeout: None,
+            default_headers: HeaderMap::new(),
+            user_agent: None,
+            invalid_default_header: None,
+            #[cfg(feature = "http3")]
+            http3_enabled: true,
+            #[cfg(feature = "http3")]
+            http3_negative_cache_duration: None,
+        }
+    }
 }
 
 impl ClientBuilder {
@@ -173,6 +265,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable or disable opportunistic HTTP/3 at runtime.
+    #[cfg(feature = "http3")]
+    pub fn http3(mut self, enabled: bool) -> Self {
+        self.http3_enabled = enabled;
+        self
+    }
+
+    /// Override the negative-cache duration after HTTP/3 probe failure.
+    #[cfg(feature = "http3")]
+    pub fn http3_negative_cache_duration(mut self, duration: Duration) -> Self {
+        self.http3_negative_cache_duration = Some(duration);
+        self
+    }
+
     /// Finalise the builder.
     pub fn build(mut self) -> Result<Client> {
         if let Some(err) = self.invalid_default_header.take() {
@@ -208,6 +314,20 @@ impl ClientBuilder {
                 hyper,
                 default_timeout: self.timeout,
                 default_headers: self.default_headers,
+                #[cfg(feature = "http3")]
+                http3_enabled: self.http3_enabled,
+                #[cfg(feature = "http3")]
+                http3_negative_cache_duration: self
+                    .http3_negative_cache_duration
+                    .unwrap_or_else(|| Duration::from_secs(5 * 60)),
+                #[cfg(feature = "http3")]
+                https_rr_cache: Arc::new(RwLock::new(HashMap::new())),
+                #[cfg(feature = "http3")]
+                alt_svc_cache: Arc::new(RwLock::new(HashMap::new())),
+                #[cfg(feature = "http3")]
+                negative_cache: Arc::new(RwLock::new(HashMap::new())),
+                #[cfg(feature = "http3")]
+                http3: Arc::new(http3::Http3State::new()),
             }),
         })
     }

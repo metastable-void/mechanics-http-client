@@ -3,6 +3,8 @@
 //! call sites actually need.
 
 use std::time::Duration;
+#[cfg(feature = "http3")]
+use std::time::Instant;
 
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, Uri};
@@ -10,8 +12,12 @@ use serde::Serialize;
 
 use crate::body::{RequestBody, empty_body, full_body};
 use crate::client::Client;
+#[cfg(feature = "http3")]
+use crate::client::Origin;
 use crate::error::{Error, Result};
 use crate::response::Response;
+#[cfg(feature = "http3")]
+use crate::{alt_svc, http3, https_rr};
 
 /// Chainable per-request builder. Construct via [`Client::get`] /
 /// [`Client::post`] / [`Client::request`] / etc.
@@ -127,6 +133,8 @@ impl RequestBuilder {
         }
         let uri = self.uri?;
 
+        #[cfg(feature = "http3")]
+        let uri_for_h3 = uri.clone();
         let mut req = Request::builder().method(self.method.clone()).uri(uri);
 
         // Default headers from the client, then per-request headers
@@ -142,7 +150,8 @@ impl RequestBuilder {
             }
         }
 
-        let body: RequestBody = match self.body {
+        let body_bytes = self.body;
+        let body: RequestBody = match body_bytes.clone() {
             None => empty_body(),
             Some(bytes) => full_body(bytes),
         };
@@ -150,6 +159,22 @@ impl RequestBuilder {
         let request = req
             .body(body)
             .map_err(|e| Error::Internal(format!("request build: {e}")))?;
+
+        #[cfg(feature = "http3")]
+        if self.client.inner.http3_enabled
+            && let Some(origin) = Origin::from_uri(&uri_for_h3)
+        {
+            let h3_request = request_for_http3(
+                self.method.clone(),
+                uri_for_h3.clone(),
+                request.headers().clone(),
+            )?;
+            match try_http3(&self.client, origin.clone(), h3_request, body_bytes.clone()).await {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
+        }
 
         let timeout = self.timeout.or(self.client.inner.default_timeout);
         let send_fut = self.client.inner.hyper.request(request);
@@ -163,7 +188,180 @@ impl RequestBuilder {
         }
         .map_err(map_legacy_error)?;
 
-        Ok(Response::new(response))
+        let response = Response::new(response);
+        #[cfg(feature = "http3")]
+        maybe_update_alt_svc(&self.client, &uri_for_h3, &response);
+        Ok(response)
+    }
+}
+
+#[cfg(feature = "http3")]
+impl Origin {
+    pub(crate) fn from_uri(uri: &Uri) -> Option<Self> {
+        if uri.scheme_str()? != "https" {
+            return None;
+        }
+        let host = uri.host()?.to_owned();
+        let port = uri.port_u16().unwrap_or(443);
+        Some(Self { host, port })
+    }
+}
+
+#[cfg(feature = "http3")]
+fn request_for_http3(method: Method, uri: Uri, headers: http::HeaderMap) -> Result<Request<()>> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(out) = builder.headers_mut() {
+        *out = headers;
+    }
+    builder
+        .body(())
+        .map_err(|e| Error::Internal(format!("HTTP/3 request build: {e}")))
+}
+
+#[cfg(feature = "http3")]
+async fn try_http3(
+    client: &Client,
+    origin: Origin,
+    request: Request<()>,
+    body: Option<Bytes>,
+) -> Result<Option<Response>> {
+    let now = Instant::now();
+    if negative_cache_hit(client, &origin, now) {
+        return Ok(None);
+    }
+
+    if let Some(entry) = https_rr_entry(client, &origin, now).await
+        && entry.has_h3
+    {
+        let mut target = origin.clone();
+        target.port = entry.port;
+        match client
+            .inner
+            .http3
+            .request(
+                target,
+                &origin.host,
+                &entry.addresses,
+                request.clone(),
+                body.clone(),
+            )
+            .await
+        {
+            Ok(response) => return Ok(Some(response)),
+            Err(http3::Http3AttemptError::Handshake(message)) => {
+                let _ = message;
+                insert_negative(client, origin.clone(), now);
+                return Ok(None);
+            }
+            Err(http3::Http3AttemptError::Stream(err)) => return Err(err),
+        }
+    }
+
+    if let Some(entry) = alt_svc_entry(client, &origin, now) {
+        let authority_host = entry.host.as_deref().unwrap_or(origin.host.as_str());
+        let target = Origin {
+            host: authority_host.to_owned(),
+            port: entry.port,
+        };
+        match client
+            .inner
+            .http3
+            .request(target, authority_host, &[], request, body)
+            .await
+        {
+            Ok(response) => return Ok(Some(response)),
+            Err(http3::Http3AttemptError::Handshake(message)) => {
+                let _ = message;
+                insert_negative(client, origin, now);
+                return Ok(None);
+            }
+            Err(http3::Http3AttemptError::Stream(err)) => return Err(err),
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "http3")]
+async fn https_rr_entry(
+    client: &Client,
+    origin: &Origin,
+    now: Instant,
+) -> Option<https_rr::HttpsRrEntry> {
+    if let Ok(mut cache) = client.inner.https_rr_cache.write() {
+        if let Some(entry) = cache.get(origin)
+            && https_rr::fresh(entry, now)
+        {
+            return Some(entry.clone());
+        }
+        cache.remove(origin);
+    }
+
+    match https_rr::lookup(origin).await {
+        Ok(Some(entry)) => {
+            if let Ok(mut cache) = client.inner.https_rr_cache.write() {
+                cache.insert(origin.clone(), entry.clone());
+            }
+            Some(entry)
+        }
+        Ok(None) | Err(_) => None,
+    }
+}
+
+#[cfg(feature = "http3")]
+fn alt_svc_entry(client: &Client, origin: &Origin, now: Instant) -> Option<alt_svc::AltSvcEntry> {
+    let Ok(mut cache) = client.inner.alt_svc_cache.write() else {
+        return None;
+    };
+    if let Some(entry) = cache.get(origin)
+        && alt_svc::fresh(entry, now)
+    {
+        return Some(entry.clone());
+    }
+    cache.remove(origin);
+    None
+}
+
+#[cfg(feature = "http3")]
+fn negative_cache_hit(client: &Client, origin: &Origin, now: Instant) -> bool {
+    let Ok(mut cache) = client.inner.negative_cache.write() else {
+        return false;
+    };
+    if let Some(expires_at) = cache.get(origin).copied()
+        && expires_at > now
+    {
+        return true;
+    }
+    cache.remove(origin);
+    false
+}
+
+#[cfg(feature = "http3")]
+fn insert_negative(client: &Client, origin: Origin, now: Instant) {
+    if let Ok(mut cache) = client.inner.negative_cache.write() {
+        cache.insert(origin, now + client.inner.http3_negative_cache_duration);
+    }
+}
+
+#[cfg(feature = "http3")]
+fn maybe_update_alt_svc(client: &Client, uri: &Uri, response: &Response) {
+    let Some(origin) = Origin::from_uri(uri) else {
+        return;
+    };
+    let Some(value) = response.headers().get(http::header::ALT_SVC) else {
+        return;
+    };
+    let update = alt_svc::parse_header(value, Instant::now(), origin.port);
+    if let Ok(mut cache) = client.inner.alt_svc_cache.write() {
+        match update {
+            alt_svc::AltSvcUpdate::Clear => {
+                cache.remove(&origin);
+            }
+            alt_svc::AltSvcUpdate::Entry(entry) => {
+                cache.insert(origin, entry);
+            }
+            alt_svc::AltSvcUpdate::None => {}
+        }
     }
 }
 

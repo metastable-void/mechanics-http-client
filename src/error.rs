@@ -34,6 +34,16 @@ pub enum Error {
     #[error("TLS error: {0}")]
     Tls(String),
 
+    /// Terminal DNS failure in the HTTP/3 discovery path.
+    #[cfg(feature = "http3")]
+    #[error("DNS error: {0}")]
+    Dns(String),
+
+    /// Terminal QUIC handshake failure in the HTTP/3 path.
+    #[cfg(feature = "http3")]
+    #[error("QUIC handshake error: {0}")]
+    QuicHandshake(String),
+
     /// Body or header decoding failed: invalid Content-Encoding,
     /// non-UTF-8 in [`Response::text`](crate::Response::text), invalid
     /// JSON in [`Response::json`](crate::Response::json), unsupported

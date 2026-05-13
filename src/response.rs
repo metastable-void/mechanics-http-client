@@ -19,7 +19,14 @@ use crate::error::{Error, Result};
 #[derive(Debug)]
 pub struct Response {
     parts: http::response::Parts,
-    body: Option<hyper::body::Incoming>,
+    body: Option<ResponseBody>,
+}
+
+#[derive(Debug)]
+enum ResponseBody {
+    Hyper(hyper::body::Incoming),
+    #[cfg(feature = "http3")]
+    Buffered(Bytes),
 }
 
 impl Response {
@@ -27,7 +34,16 @@ impl Response {
         let (parts, body) = response.into_parts();
         Self {
             parts,
-            body: Some(body),
+            body: Some(ResponseBody::Hyper(body)),
+        }
+    }
+
+    #[cfg(feature = "http3")]
+    pub(crate) fn new_buffered(response: http::Response<Bytes>) -> Self {
+        let (parts, body) = response.into_parts();
+        Self {
+            parts,
+            body: Some(ResponseBody::Buffered(body)),
         }
     }
 
@@ -73,7 +89,19 @@ impl Response {
             .body
             .take()
             .ok_or_else(|| Error::Internal("response body already consumed".to_owned()))?;
-        let raw = collect_body_with_cap(body, max_wire_bytes).await?;
+        let raw = match body {
+            ResponseBody::Hyper(body) => collect_body_with_cap(body, max_wire_bytes).await?,
+            #[cfg(feature = "http3")]
+            ResponseBody::Buffered(body) => {
+                if body.len() > max_wire_bytes {
+                    return Err(Error::BodyTooLarge {
+                        limit: max_wire_bytes,
+                        seen: max_wire_bytes,
+                    });
+                }
+                body
+            }
+        };
         decompress(
             self.parts
                 .headers
