@@ -1,0 +1,39 @@
+[package]
+name = "mechanics-http-client"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+authors = ["metastable-void"]
+description = "Small reqwest-shaped HTTP client built on hyper-rustls + webpki-roots, with aws-lc-rs as the sole crypto provider. Owned by the mechanics family; depends on nothing from the philharmonic family."
+license = "Apache-2.0 OR MPL-2.0"
+publish = false
+
+[dependencies]
+brotli = "8"
+bytes = "1"
+flate2 = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "webpki-tokio", "aws-lc-rs"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "time"] }
+tracing = "0.1"
+url = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "rt-multi-thread"] }
+wiremock = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+overflow-checks = true
