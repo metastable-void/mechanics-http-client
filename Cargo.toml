@@ -1,12 +1,16 @@
 [package]
 name = "mechanics-http-client"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["metastable-void"]
-description = "Small reqwest-shaped HTTP client built on hyper-rustls + webpki-roots, with aws-lc-rs as the sole crypto provider. Owned by the mechanics family; depends on nothing from the philharmonic family."
+description = "Small reqwest-shaped HTTP client built on hyper-rustls + webpki-roots, with aws-lc-rs as the sole crypto provider. Bundled Mozilla CA bundle only — no OS-native trust."
 license = "Apache-2.0 OR MPL-2.0"
-publish = false
+readme = "README.md"
+repository = "https://github.com/metastable-void/mechanics-http-client"
+homepage = "https://github.com/metastable-void/mechanics-http-client"
+keywords = ["http", "client", "rustls", "webpki-roots", "aws-lc-rs"]
+categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
 brotli = "8"
@@ -22,8 +26,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "time"] }
-tracing = "0.1"
-url = "2"
 webpki-roots = "1"
 
 [dev-dependencies]

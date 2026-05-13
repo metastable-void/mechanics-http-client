@@ -8,7 +8,7 @@
 
 use thiserror::Error;
 
-/// Convenience alias: `Result<T, Error>` with this crate's [`Error`].
+/// Convenience alias: `Result<T, Error>` with this crate's [`enum@Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Failures surfaced by [`Client`](crate::Client) / [`RequestBuilder`](crate::RequestBuilder)

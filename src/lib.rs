@@ -1,14 +1,44 @@
-//! `mechanics-http-client` — a small, reqwest-shaped HTTP client built
-//! on `hyper-rustls` + `webpki-roots`, with `aws-lc-rs` as the sole
-//! crypto provider.
+//! A small, [`reqwest`]-shaped HTTP client built on
+//! [`hyper`] 1.x + [`hyper_rustls`], with [`aws_lc_rs`] as the
+//! sole crypto provider and the bundled [`webpki_roots`] Mozilla
+//! CA bundle as the only TLS trust store.
 //!
-//! The crate is owned by the mechanics family and **does not depend
-//! on any philharmonic-family crate**. Consumers throughout the
-//! workspace (mechanics-core, the connector implementations, the
-//! API server binary, etc.) drive their outbound HTTPS through this
-//! crate's `Client`.
+//! The crate is owned by the mechanics family and **does not
+//! depend on any philharmonic-family crate**.
 //!
-//! ## Public surface
+//! [`reqwest`]: https://docs.rs/reqwest
+//! [`hyper`]: https://docs.rs/hyper
+//! [`hyper_rustls`]: https://docs.rs/hyper-rustls
+//! [`aws_lc_rs`]: https://docs.rs/aws-lc-rs
+//! [`webpki_roots`]: https://docs.rs/webpki-roots
+//!
+//! # Quick example
+//!
+//! ```no_run
+//! use mechanics_http_client::{Client, StatusCode};
+//! use std::time::Duration;
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let client = Client::builder()
+//!     .timeout(Duration::from_secs(10))
+//!     .user_agent("my-app/1.0")
+//!     .build()?;
+//!
+//! let response = client
+//!     .post("https://httpbin.org/anything")
+//!     .bearer_auth("secret-token")
+//!     .header("x-trace-id", "abc123")
+//!     .json(&serde_json::json!({ "hello": "world" }))
+//!     .send()
+//!     .await?;
+//!
+//! assert_eq!(response.status(), StatusCode::OK);
+//! let body: serde_json::Value = response.json().await?;
+//! println!("server replied: {body}");
+//! # Ok(()) }
+//! ```
+//!
+//! # Public surface
 //!
 //! - [`Client`] / [`ClientBuilder`] — connection-pool-managed
 //!   HTTPS client. ALPN negotiates HTTP/1.1 or HTTP/2; TLS trust
@@ -16,36 +46,42 @@
 //! - [`RequestBuilder`] — chainable per-request configuration
 //!   (`.header(...)`, `.bearer_auth(...)`, `.timeout(...)`,
 //!   `.body(...)`, `.json(...)`, `.send().await`).
-//! - [`Response`] — `.status()`, `.headers()`, `.bytes()`,
-//!   `.bytes_with_cap()`, `.text()`, `.json::<T>()`.
-//!   `Content-Encoding: gzip`, `deflate`, `br` decompressed
-//!   transparently in `bytes()` / `text()` / `json()` paths.
-//! - [`Error`] / [`Result`] — structured error model
-//!   (`Timeout`, `Unreachable`, `Tls`, `Decode`, `Status`,
-//!   `BodyTooLarge`, `InvalidUri`, `InvalidHeader`, `Cancelled`,
-//!   `Internal`).
+//! - [`Response`] — `.status()`, `.headers()`, `.version()`,
+//!   `.content_length()`, `.bytes()`, `.bytes_with_cap()`,
+//!   `.text()`, `.json::<T>()`. `Content-Encoding: gzip`,
+//!   `deflate`, `br` decompressed transparently in `bytes()` /
+//!   `text()` / `json()` paths.
+//! - [`Error`] / [`Result`] — structured error model. Non-2xx
+//!   responses are intentionally **not** errors at this layer
+//!   (inspect [`Response::status`] instead).
 //!
-//! ## What's deliberately out of scope (for now)
+//! # Bounded-memory body reading
+//!
+//! [`Response::bytes_with_cap`] reads the body up to a cap on
+//! **wire bytes** (post-TLS, pre-decompression), surfacing
+//! [`Error::BodyTooLarge`] if exceeded. A small compressed body
+//! that expands past the cap is allowed through; defend against
+//! decompression bombs at a higher layer if your call site cares.
+//!
+//! # What's deliberately out of scope (for now)
 //!
 //! - Multipart form bodies, cookies, proxies, redirect-following
-//!   knobs. None of the workspace's call sites need them today;
-//!   the API can grow as call sites do.
-//! - Streaming chunk()-style response iteration. `bytes_with_cap`
-//!   covers the workspace's existing "cap-on-body-bytes" use
-//!   case. The cap applies to **wire bytes** (post-TLS, pre-
-//!   decompression) — a slight tightening of the previous
-//!   reqwest-based behavior, but operationally equivalent for
-//!   the bounded response sizes the workspace handles.
-//! - HTTP/3. Reserved for D22 (later session).
+//!   knobs.
+//! - Streaming `chunk()`-style response iteration.
+//! - HTTP/3.
 //!
-//! ## TLS posture (load-bearing)
+//! # TLS posture (load-bearing)
 //!
-//! Trust store: `webpki-roots` bundled Mozilla CA bundle, frozen
-//! at this crate's compile time. No OS-native trust, no
-//! `rustls-platform-verifier`, no `rustls-native-certs`. The
-//! crypto provider is `aws-lc-rs` and is installed lazily on
-//! first `Client::builder().build()` via the rustls
-//! `CryptoProvider::install_default()` API. No `ring`.
+//! - **Trust store:** `webpki-roots` bundled Mozilla CA bundle,
+//!   frozen at this crate's compile time. No OS-native trust, no
+//!   `rustls-platform-verifier`, no `rustls-native-certs`.
+//! - **Crypto provider:** `aws-lc-rs`. Installed lazily as
+//!   rustls's default `CryptoProvider` on first
+//!   `Client::builder().build()`. No `ring`.
+//! - **Protocol versions:** rustls defaults (TLS 1.2 and 1.3).
+
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
 
 mod body;
 mod client;
