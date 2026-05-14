@@ -17,7 +17,7 @@ brotli = { version = "8", default-features = false, features = ["std"] }
 bytes = { version = "1", default-features = false, features = ["std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 h3 = { version = "0.0.8", default-features = false, features = [], optional = true }
-h3-quinn = { version = "0.0.10", default-features = false, features = [], optional = true }
+h3-quinn = { package = "mechanics-h3-quinn", version = "0.0.10", default-features = false, features = [], optional = true }
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"], optional = true }
 http = { version = "1", default-features = false, features = ["std"] }
 http-body-util = { version = "0.1", default-features = false, features = [] }
