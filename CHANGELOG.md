@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2] - 2026-05-14
+
+### Changed
+- Internal Cargo.toml audit: `default-features = false` set on
+  direct dependencies with explicit feature lists for what the
+  crate actually uses. No behaviour change. (D24)
+
 ## [0.2.1] - 2026-05-13
 
 - Security: bump `hickory-resolver` 0.25.2 -> 0.26.1 to pick up upstream
