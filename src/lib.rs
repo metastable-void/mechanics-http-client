@@ -87,6 +87,7 @@
 mod alt_svc;
 mod body;
 mod client;
+mod dns;
 mod error;
 #[cfg(feature = "http3")]
 mod http3;

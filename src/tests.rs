@@ -4,6 +4,8 @@
 //! by a self-signed TLS test fixture here.
 
 use serde_json::json;
+#[cfg(feature = "http3")]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -155,29 +157,17 @@ fn alt_svc_parser_clear_evicts() {
 #[cfg(feature = "http3")]
 #[test]
 fn https_rr_parser_honours_h3_port_and_hints() {
-    use hickory_resolver::net::proto::rr::rdata::svcb::{Alpn, IpHint, SvcParamKey, SvcParamValue};
-    use hickory_resolver::net::proto::rr::rdata::{A, AAAA};
-
     let expires_at = std::time::Instant::now() + Duration::from_secs(60);
-    let entry = https_rr::parse_svcb(
-        &[
-            (
-                SvcParamKey::Alpn,
-                SvcParamValue::Alpn(Alpn(vec!["h2".to_owned(), "h3".to_owned()])),
-            ),
-            (SvcParamKey::Port, SvcParamValue::Port(8443)),
-            (
-                SvcParamKey::Ipv4Hint,
-                SvcParamValue::Ipv4Hint(IpHint(vec![A::new(192, 0, 2, 1)])),
-            ),
-            (
-                SvcParamKey::Ipv6Hint,
-                SvcParamValue::Ipv6Hint(IpHint(vec![AAAA::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)])),
-            ),
-        ],
-        443,
+    let record = mechanics_dns::HttpsRecord {
+        priority: 1,
+        target_name: ".".to_owned(),
+        alpns: vec!["h2".to_owned(), "h3".to_owned()],
+        port: Some(8443),
+        ipv4_hints: vec![Ipv4Addr::new(192, 0, 2, 1)],
+        ipv6_hints: vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)],
         expires_at,
-    );
+    };
+    let entry = https_rr::parse_https_record(&record, 443);
 
     assert!(entry.has_h3);
     assert_eq!(entry.port, 8443);

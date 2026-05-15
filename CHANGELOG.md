@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- DNS resolution now goes through the shared `mechanics-dns`
+  crate for TCP/TLS connection resolution, HTTP/3 fallback
+  address resolution, and HTTPS RR lookup. Hosts with a normal
+  resolver configuration keep using that configuration; hosts
+  where `/etc/resolv.conf` is absent now fall back to the
+  documented Cloudflare resolver set instead of failing during
+  resolver setup.
+
 ## [0.2.4] - 2026-05-15
 
 ### Fixed

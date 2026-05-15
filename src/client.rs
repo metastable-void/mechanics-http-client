@@ -14,6 +14,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 
 use crate::body::RequestBody;
+use crate::dns::HyperDnsResolver;
 use crate::error::{Error, Result};
 use crate::request::RequestBuilder;
 use crate::tls;
@@ -23,7 +24,8 @@ use crate::{alt_svc, http3, https_rr};
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Type alias for the hyper-util client backing each [`Client`].
-pub(crate) type HyperClient = HyperLegacyClient<HttpsConnector<HttpConnector>, RequestBody>;
+pub(crate) type HyperClient =
+    HyperLegacyClient<HttpsConnector<HttpConnector<HyperDnsResolver>>, RequestBody>;
 
 /// HTTPS client built on hyper-rustls + webpki-roots + aws-lc-rs.
 ///
@@ -47,6 +49,8 @@ pub(crate) struct ClientInner {
     pub(crate) hyper: HyperClient,
     pub(crate) default_timeout: Option<Duration>,
     pub(crate) default_headers: HeaderMap,
+    #[cfg(feature = "http3")]
+    pub(crate) dns: mechanics_dns::Resolver,
     #[cfg(feature = "http3")]
     pub(crate) http3_enabled: bool,
     #[cfg(feature = "http3")]
@@ -291,8 +295,10 @@ impl ClientBuilder {
         }
 
         let tls_config = tls::webpki_roots_client_config()?;
+        let dns = mechanics_dns::Resolver::new()
+            .map_err(|error| Error::Unreachable(format!("DNS resolver init failed: {error}")))?;
 
-        let mut http = HttpConnector::new();
+        let mut http = HttpConnector::new_with_resolver(HyperDnsResolver::new(dns.clone()));
         http.enforce_http(false);
         http.set_connect_timeout(Some(DEFAULT_CONNECT_TIMEOUT));
 
@@ -317,6 +323,8 @@ impl ClientBuilder {
                 hyper,
                 default_timeout: self.timeout,
                 default_headers: self.default_headers,
+                #[cfg(feature = "http3")]
+                dns,
                 #[cfg(feature = "http3")]
                 http3_enabled: self.http3_enabled,
                 #[cfg(feature = "http3")]

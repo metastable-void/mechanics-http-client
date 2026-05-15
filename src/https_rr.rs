@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Instant;
 
-use hickory_resolver::TokioResolver;
-use hickory_resolver::net::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
-use hickory_resolver::net::proto::rr::{RData, RecordType};
+use mechanics_dns::{HttpsRecord, Resolver};
 
 use crate::client::Origin;
 use crate::error::{Error, Result};
@@ -31,24 +29,15 @@ pub(crate) fn fresh(entry: &HttpsRrEntry, now: Instant) -> bool {
     entry.expires_at > now
 }
 
-pub(crate) async fn lookup(origin: &Origin) -> Result<Option<HttpsRrEntry>> {
-    let resolver = TokioResolver::builder_tokio()
-        .map_err(|e| Error::Dns(e.to_string()))?
-        .build()
-        .map_err(|e| Error::Dns(e.to_string()))?;
-    let lookup = resolver
-        .lookup(origin.host.as_str(), RecordType::HTTPS)
+pub(crate) async fn lookup(resolver: &Resolver, origin: &Origin) -> Result<Option<HttpsRrEntry>> {
+    let records = resolver
+        .lookup_https(origin.host.as_str())
         .await
         .map_err(|e| Error::Dns(e.to_string()))?;
 
-    let expires_at = lookup.valid_until();
     let mut best = None;
-    for record in lookup.answers() {
-        let record = &record.data;
-        let RData::HTTPS(https) = record else {
-            continue;
-        };
-        let parsed = parse_svcb(&https.0.svc_params, origin.port, expires_at);
+    for record in records {
+        let parsed = parse_https_record(&record, origin.port);
         if parsed.has_h3 {
             return Ok(Some(parsed));
         }
@@ -58,47 +47,11 @@ pub(crate) async fn lookup(origin: &Origin) -> Result<Option<HttpsRrEntry>> {
     Ok(best)
 }
 
-pub(crate) fn parse_svcb(
-    params: &[(SvcParamKey, SvcParamValue)],
-    origin_port: u16,
-    expires_at: Instant,
-) -> HttpsRrEntry {
-    let mut port = origin_port;
-    let mut addresses = Vec::new();
-    let mut has_h3 = false;
-
-    for (key, value) in params {
-        match (key, value) {
-            (SvcParamKey::Alpn, SvcParamValue::Alpn(alpns)) => {
-                has_h3 = alpns.0.iter().any(|alpn| alpn == "h3");
-            }
-            (SvcParamKey::Port, SvcParamValue::Port(discovered_port)) => {
-                port = *discovered_port;
-            }
-            (SvcParamKey::Ipv4Hint, SvcParamValue::Ipv4Hint(hints)) => {
-                addresses.extend(
-                    hints
-                        .0
-                        .iter()
-                        .filter_map(|hint| hint.to_string().parse::<IpAddr>().ok()),
-                );
-            }
-            (SvcParamKey::Ipv6Hint, SvcParamValue::Ipv6Hint(hints)) => {
-                addresses.extend(
-                    hints
-                        .0
-                        .iter()
-                        .filter_map(|hint| hint.to_string().parse::<IpAddr>().ok()),
-                );
-            }
-            _ => {}
-        }
-    }
-
+pub(crate) fn parse_https_record(record: &HttpsRecord, origin_port: u16) -> HttpsRrEntry {
     HttpsRrEntry {
-        port,
-        addresses,
-        has_h3,
-        expires_at,
+        port: record.port.unwrap_or(origin_port),
+        addresses: record.address_hints().collect(),
+        has_h3: record.has_alpn("h3"),
+        expires_at: record.expires_at,
     }
 }

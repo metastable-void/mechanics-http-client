@@ -10,6 +10,7 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use http::{Request, Response as HttpResponse};
 use http_body::Frame;
+use mechanics_dns::Resolver;
 use quinn::crypto::rustls::QuicClientConfig;
 
 use crate::client::Origin;
@@ -51,6 +52,7 @@ impl Http3State {
 
     pub(crate) async fn request(
         &self,
+        resolver: &Resolver,
         origin: Origin,
         authority_host: &str,
         addresses: &[IpAddr],
@@ -58,7 +60,7 @@ impl Http3State {
         body: Option<Bytes>,
     ) -> std::result::Result<Response, Http3AttemptError> {
         let mut sender = match self
-            .connection(authority_host, origin.port, addresses)
+            .connection(resolver, authority_host, origin.port, addresses)
             .await
         {
             Ok(sender) => sender,
@@ -101,12 +103,13 @@ impl Http3State {
 
     async fn connection(
         &self,
+        resolver: &Resolver,
         authority_host: &str,
         port: u16,
         addresses: &[IpAddr],
     ) -> std::result::Result<H3SendRequest, String> {
         let endpoint = self.endpoint()?;
-        let addr = first_socket_addr(authority_host, port, addresses).await?;
+        let addr = first_socket_addr(resolver, authority_host, port, addresses).await?;
         let connecting = endpoint
             .connect(addr, authority_host)
             .map_err(|e| e.to_string())?;
@@ -228,6 +231,7 @@ impl http_body::Body for H3ResponseBody {
 }
 
 async fn first_socket_addr(
+    resolver: &Resolver,
     host: &str,
     port: u16,
     addresses: &[IpAddr],
@@ -236,12 +240,15 @@ async fn first_socket_addr(
         return Ok(SocketAddr::new(addr, port));
     }
 
-    let mut addrs =
-        tokio::time::timeout(H3_DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((host, port)))
-            .await
-            .map_err(|_| format!("HTTP/3 DNS lookup timed out after {H3_DNS_LOOKUP_TIMEOUT:?}"))?
-            .map_err(|e| e.to_string())?;
+    let addrs = tokio::time::timeout(
+        H3_DNS_LOOKUP_TIMEOUT,
+        resolver.lookup_socket_addrs(host, port),
+    )
+    .await
+    .map_err(|_| format!("HTTP/3 DNS lookup timed out after {H3_DNS_LOOKUP_TIMEOUT:?}"))?
+    .map_err(|e| e.to_string())?;
     addrs
+        .into_iter()
         .next()
         .ok_or_else(|| format!("no socket addresses for {host}:{port}"))
 }

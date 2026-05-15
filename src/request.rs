@@ -47,6 +47,7 @@ enum RequestPayload {
 }
 
 impl RequestPayload {
+    #[cfg(feature = "http3")]
     fn replayable_for_h3(&self) -> Option<Option<Bytes>> {
         match self {
             Self::Empty => Some(None),
@@ -346,6 +347,7 @@ async fn request_http3_with_stale_retry(
             .inner
             .http3
             .request(
+                &client.inner.dns,
                 target.target.clone(),
                 target.authority_host,
                 target.addresses,
@@ -395,7 +397,11 @@ async fn https_rr_entry(
         cache.remove(origin);
     }
 
-    let lookup = tokio::time::timeout(H3_HTTPS_RR_LOOKUP_TIMEOUT, https_rr::lookup(origin)).await;
+    let lookup = tokio::time::timeout(
+        H3_HTTPS_RR_LOOKUP_TIMEOUT,
+        https_rr::lookup(&client.inner.dns, origin),
+    )
+    .await;
     match lookup {
         Err(_) => None,
         Ok(result) => match result {
