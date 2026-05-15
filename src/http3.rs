@@ -96,6 +96,10 @@ impl Http3State {
             let remaining = chunk.remaining();
             body.extend_from_slice(&chunk.copy_to_bytes(remaining));
         }
+        let _trailers = stream
+            .recv_trailers()
+            .await
+            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
 
         Ok(Response::new_buffered(HttpResponse::from_parts(
             parts,
