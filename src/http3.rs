@@ -19,6 +19,7 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 const H3_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const H3_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const H3_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Cached HTTP/3 transport state owned by a [`Client`](crate::Client).
 pub(crate) struct Http3State {
@@ -58,15 +59,16 @@ impl Http3State {
             Err(err) => return Err(Http3AttemptError::Handshake(err)),
         };
 
-        let mut sender = sender.lock().await;
-        let mut stream =
+        let mut stream = {
+            let mut sender = sender.lock().await;
             sender
                 .send_request(request)
                 .await
                 .map_err(|e| Http3AttemptError::Stream {
                     error: Error::Cancelled(e.to_string()),
                     retry_without_h3: true,
-                })?;
+                })?
+        };
 
         if let Some(body) = body {
             stream
@@ -118,12 +120,16 @@ impl Http3State {
         let connecting = endpoint
             .connect(addr, authority_host)
             .map_err(|e| e.to_string())?;
-        let connection = connecting.await.map_err(|e| e.to_string())?;
-        let quic = h3_quinn::Connection::new(connection);
-        let (mut driver, send_request) = h3::client::builder()
-            .build(quic)
+        let connection = tokio::time::timeout(H3_CONNECT_TIMEOUT, connecting)
             .await
+            .map_err(|_| format!("HTTP/3 connect timed out after {H3_CONNECT_TIMEOUT:?}"))?
             .map_err(|e| e.to_string())?;
+        let quic = h3_quinn::Connection::new(connection);
+        let (mut driver, send_request) =
+            tokio::time::timeout(H3_CONNECT_TIMEOUT, h3::client::builder().build(quic))
+                .await
+                .map_err(|_| format!("HTTP/3 setup timed out after {H3_CONNECT_TIMEOUT:?}"))?
+                .map_err(|e| e.to_string())?;
         tokio::spawn(async move {
             let _ = driver.wait_idle().await;
         });

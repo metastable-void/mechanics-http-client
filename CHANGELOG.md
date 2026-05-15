@@ -23,6 +23,17 @@
   this retry helper instead of duplicating the
   match-on-Http3AttemptError arms. Same behaviour, less
   drift surface.
+- 3-second timeout (`H3_CONNECT_TIMEOUT`) wraps both
+  `quinn::Endpoint::connect().await` and
+  `h3::client::builder().build(quic).await` so a half-finished
+  QUIC handshake or h3-setup can't block the request
+  indefinitely; on timeout the request falls back to h1/h2
+  via the existing retry / negative-cache path.
+- Cached `h3::client::SendRequest` mutex is now released as
+  soon as `send_request` returns the stream, rather than
+  being held for the lifetime of the stream. Concurrent
+  requests against the same cached h3 connection no longer
+  serialise on stream-data-send / response-read.
 
 ### Fixed (mildly breaking on the internal `Http3AttemptError`)
 - `try_http3` failures now distinguish "no wire bytes sent
