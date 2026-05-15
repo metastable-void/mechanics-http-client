@@ -4,11 +4,13 @@
 //! `json` paths. `bytes_with_cap` caps **wire bytes** (post-TLS,
 //! pre-decompression).
 
+use std::convert::Infallible;
 use std::io::Read;
 
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, StatusCode, Version};
-use http_body_util::BodyExt;
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full};
 use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
@@ -79,6 +81,25 @@ impl Response {
         self.bytes_with_cap(usize::MAX).await
     }
 
+    /// Return the raw response body as a stream of DATA frames.
+    ///
+    /// This path does not transparently decompress `Content-Encoding`;
+    /// callers forwarding the body must preserve that header.
+    pub fn into_body(mut self) -> Result<UnsyncBoxBody<Bytes, Error>> {
+        let body = self
+            .body
+            .take()
+            .ok_or_else(|| Error::Internal("response body already consumed".to_owned()))?;
+        let body = match body {
+            ResponseBody::Hyper(body) => body.map_err(map_hyper_body_error).boxed_unsync(),
+            #[cfg(feature = "http3")]
+            ResponseBody::Buffered(body) => Full::new(body)
+                .map_err(|error: Infallible| match error {})
+                .boxed_unsync(),
+        };
+        Ok(body)
+    }
+
     /// Read the response body with a wire-byte cap, then
     /// transparently decompress per `Content-Encoding`. The cap
     /// applies to bytes received from the network — decompressed
@@ -147,16 +168,21 @@ async fn collect_body_with_cap(mut body: hyper::body::Incoming, max_bytes: usize
                 // Trailers / unknown frame kinds: ignore.
             }
             Some(Err(e)) => {
-                let message = e.to_string();
-                let lower = message.to_lowercase();
-                if lower.contains("canceled") || lower.contains("cancelled") {
-                    return Err(Error::Cancelled(message));
-                }
-                return Err(Error::Unreachable(message));
+                return Err(map_hyper_body_error(e));
             }
         }
     }
     Ok(buf.freeze())
+}
+
+fn map_hyper_body_error(error: hyper::Error) -> Error {
+    let message = error.to_string();
+    let lower = message.to_lowercase();
+    if lower.contains("canceled") || lower.contains("cancelled") {
+        Error::Cancelled(message)
+    } else {
+        Error::Unreachable(message)
+    }
 }
 
 fn decompress(encoding: Option<&str>, body: Bytes) -> Result<Bytes> {

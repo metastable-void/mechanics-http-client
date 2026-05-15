@@ -57,6 +57,22 @@
   path directly. The connector-router uses this to forward
   inbound bodies without the prior `BodyExt::collect()`
   buffering step that blocked the upstream TCP dial.
+- `Response::into_body()` returns the raw response body as
+  `UnsyncBoxBody<Bytes, Error>` for forwarders that need to
+  stream the response back to their caller without
+  buffering. This path does **not** transparently
+  decompress `Content-Encoding`, so callers forwarding the
+  body must preserve the `Content-Encoding` header verbatim.
+  The decompressing `bytes()` / `text()` / `json()` paths
+  are unchanged; new path is opt-in via `into_body()`.
+
+### Changed
+- Body-frame error mapping factored into a private
+  `map_hyper_body_error` helper used by both
+  `collect_body_with_cap` and the new streaming-body path.
+  Same `Cancelled` / `Unreachable` classification as before;
+  the move just stops duplicating the heuristic across two
+  consumers.
 
 ### Fixed (mildly breaking on the internal `Http3AttemptError`)
 - `try_http3` failures now distinguish "no wire bytes sent
