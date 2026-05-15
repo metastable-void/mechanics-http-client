@@ -60,21 +60,21 @@ impl Http3State {
             Err(err) => return Err(Http3AttemptError::Handshake(err)),
         };
 
-        let mut stream = {
+        let mut stream = tokio::time::timeout(H3_STREAM_OPEN_TIMEOUT, async {
             let mut sender = sender.lock().await;
-            tokio::time::timeout(H3_STREAM_OPEN_TIMEOUT, sender.send_request(request))
-                .await
-                .map_err(|_| Http3AttemptError::Stream {
-                    error: Error::Cancelled(format!(
-                        "HTTP/3 request stream open timed out after {H3_STREAM_OPEN_TIMEOUT:?}"
-                    )),
-                    retry_without_h3: true,
-                })?
-                .map_err(|e| Http3AttemptError::Stream {
-                    error: Error::Cancelled(e.to_string()),
-                    retry_without_h3: true,
-                })?
-        };
+            sender.send_request(request).await
+        })
+        .await
+        .map_err(|_| Http3AttemptError::Stream {
+            error: Error::Cancelled(format!(
+                "HTTP/3 request stream open timed out after {H3_STREAM_OPEN_TIMEOUT:?}"
+            )),
+            retry_without_h3: true,
+        })?
+        .map_err(|e| Http3AttemptError::Stream {
+            error: Error::Cancelled(e.to_string()),
+            retry_without_h3: true,
+        })?;
 
         if let Some(body) = body {
             stream

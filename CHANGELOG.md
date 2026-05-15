@@ -31,12 +31,19 @@
   via the existing retry / negative-cache path. Tightened from
   3 s — the support-chat path must fall back quickly when H3
   is stale or unreachable.
-- 150 ms `H3_STREAM_OPEN_TIMEOUT` wraps
-  `sender.send_request()`. A cached `h3::client::SendRequest`
-  whose underlying QUIC connection has gone stale can hang on
-  the bidi-stream-open step — pre-wire, no bytes ever sent —
-  and consume the full outer mechanics timeout. The new
-  bound surfaces a stale sender as
+- 150 ms `H3_STREAM_OPEN_TIMEOUT` wraps both **the cached
+  sender mutex acquisition** and the subsequent
+  `sender.send_request()` call. A cached
+  `h3::client::SendRequest` whose underlying QUIC connection
+  has gone stale can hang on the bidi-stream-open step —
+  pre-wire, no bytes ever sent — and consume the full outer
+  mechanics timeout. Wrapping the mutex acquisition as well
+  means a *concurrent* in-flight stream-open against the same
+  cached sender can't block a second mechanics job-task for
+  the full outer endpoint timeout either: if the lock isn't
+  available within 150 ms, the second task short-circuits to
+  the same retry/fallback path. The new bound surfaces a
+  stale sender as
   `Error::Cancelled { retry_without_h3: true }`, identical
   to an immediate stream-open failure: cached connection
   evicted, fresh H3 retry attempted, then TCP fallback.
