@@ -20,6 +20,7 @@ h3 = { version = "0.0.8", default-features = false, features = [], optional = tr
 h3-quinn = { package = "mechanics-h3-quinn", version = "0.0.10", default-features = false, features = [], optional = true }
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["system-config", "tokio"], optional = true }
 http = { version = "1", default-features = false, features = ["std"] }
+http-body = { version = "1", default-features = false }
 http-body-util = { version = "0.1", default-features = false, features = [] }
 hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "tls12", "webpki-tokio"] }

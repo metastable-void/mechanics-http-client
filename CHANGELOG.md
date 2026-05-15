@@ -34,6 +34,29 @@
   being held for the lifetime of the stream. Concurrent
   requests against the same cached h3 connection no longer
   serialise on stream-data-send / response-read.
+- H3 response path now drains trailers via
+  `stream.recv_trailers().await` after the DATA-frame loop
+  before returning the buffered `Response`. Without this,
+  the response stream stays "unfinished" on the reused QUIC
+  connection — the first request succeeds, but the next
+  request on the same connection hangs until the mechanics
+  300 s timeout fires. Trailers themselves are discarded
+  (no API surface yet); reading them is what completes the
+  stream.
+
+### Added
+- `RequestBuilder::body_streaming(body)` accepts any
+  `http_body::Body<Data = Bytes>` impl, forwarding it as-is
+  to the upstream HTTP/1.1 or HTTP/2 connection without
+  buffering. Internally, the request body now goes through
+  a `RequestPayload` enum (`Empty | Replayable(Bytes) |
+  Streaming(RequestBody)`). H3 attempts only fire for
+  `Empty` / `Replayable` payloads — a `Streaming` body
+  can't be safely replayed after an H3 failure, so those
+  requests bypass H3 and use the negotiated TCP transport
+  path directly. The connector-router uses this to forward
+  inbound bodies without the prior `BodyExt::collect()`
+  buffering step that blocked the upstream TCP dial.
 
 ### Fixed (mildly breaking on the internal `Http3AttemptError`)
 - `try_http3` failures now distinguish "no wire bytes sent

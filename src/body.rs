@@ -1,22 +1,32 @@
-//! Request-body plumbing. The crate's request paths all carry either
-//! no body or a fully-buffered `Bytes` blob; this keeps the body
-//! type simple ([`http_body_util::Full<Bytes>`]) and avoids the
-//! complexity of streaming request bodies, which no current call
-//! site needs.
+//! Request-body plumbing.
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use std::convert::Infallible;
+use std::error::Error as StdError;
 
-/// Type-erased request body. Either empty or a single buffered
-/// `Bytes` chunk.
-pub(crate) type RequestBody = BoxBody<Bytes, Infallible>;
+pub(crate) type BoxError = Box<dyn StdError + Send + Sync>;
+
+/// Type-erased request body.
+pub(crate) type RequestBody = UnsyncBoxBody<Bytes, BoxError>;
 
 pub(crate) fn empty_body() -> RequestBody {
-    Empty::<Bytes>::new().boxed()
+    Empty::<Bytes>::new()
+        .map_err(|error: Infallible| match error {})
+        .boxed_unsync()
 }
 
 pub(crate) fn full_body(bytes: Bytes) -> RequestBody {
-    Full::new(bytes).boxed()
+    Full::new(bytes)
+        .map_err(|error: Infallible| match error {})
+        .boxed_unsync()
+}
+
+pub(crate) fn streaming_body<B>(body: B) -> RequestBody
+where
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    body.map_err(Into::into).boxed_unsync()
 }

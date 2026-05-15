@@ -12,7 +12,7 @@ use bytes::Bytes;
 use http::{HeaderName, HeaderValue, Method, Request, Uri};
 use serde::Serialize;
 
-use crate::body::{RequestBody, empty_body, full_body};
+use crate::body::{BoxError, RequestBody, empty_body, full_body, streaming_body};
 use crate::client::Client;
 #[cfg(feature = "http3")]
 use crate::client::Origin;
@@ -32,9 +32,33 @@ pub struct RequestBuilder {
     method: Method,
     uri: Result<Uri>,
     headers: http::HeaderMap,
-    body: Option<Bytes>,
+    body: RequestPayload,
     timeout: Option<Duration>,
     deferred_error: Option<Error>,
+}
+
+enum RequestPayload {
+    Empty,
+    Replayable(Bytes),
+    Streaming(RequestBody),
+}
+
+impl RequestPayload {
+    fn replayable_for_h3(&self) -> Option<Option<Bytes>> {
+        match self {
+            Self::Empty => Some(None),
+            Self::Replayable(bytes) => Some(Some(bytes.clone())),
+            Self::Streaming(_) => None,
+        }
+    }
+
+    fn into_body(self) -> RequestBody {
+        match self {
+            Self::Empty => empty_body(),
+            Self::Replayable(bytes) => full_body(bytes),
+            Self::Streaming(body) => body,
+        }
+    }
 }
 
 impl RequestBuilder {
@@ -58,7 +82,7 @@ impl RequestBuilder {
             method,
             uri,
             headers: http::HeaderMap::new(),
-            body: None,
+            body: RequestPayload::Empty,
             timeout: None,
             deferred_error: None,
         }
@@ -102,7 +126,22 @@ impl RequestBuilder {
 
     /// Set the request body to the given bytes.
     pub fn body(mut self, bytes: impl Into<Bytes>) -> Self {
-        self.body = Some(bytes.into());
+        self.body = RequestPayload::Replayable(bytes.into());
+        self
+    }
+
+    /// Set the request body to a streaming [`http_body::Body`].
+    ///
+    /// Streaming bodies are forwarded over the negotiated TCP
+    /// transport path. Opportunistic HTTP/3 is reserved for empty or
+    /// replayable byte bodies because the client may need to retry on
+    /// a fresh connection before falling back to TCP.
+    pub fn body_streaming<B>(mut self, body: B) -> Self
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        self.body = RequestPayload::Streaming(streaming_body(body));
         self
     }
 
@@ -112,7 +151,7 @@ impl RequestBuilder {
     pub fn json<T: ?Sized + Serialize>(mut self, value: &T) -> Self {
         match serde_json::to_vec(value) {
             Ok(bytes) => {
-                self.body = Some(Bytes::from(bytes));
+                self.body = RequestPayload::Replayable(Bytes::from(bytes));
                 if !self.headers.contains_key(http::header::CONTENT_TYPE) {
                     self.headers.insert(
                         http::header::CONTENT_TYPE,
@@ -152,28 +191,21 @@ impl RequestBuilder {
             }
         }
 
-        let body_bytes = self.body;
-        let body: RequestBody = match body_bytes.clone() {
-            None => empty_body(),
-            Some(bytes) => full_body(bytes),
-        };
-
-        let request = req
-            .body(body)
-            .map_err(|e| Error::Internal(format!("request build: {e}")))?;
+        #[cfg(feature = "http3")]
+        let h3_body = self.body.replayable_for_h3();
 
         #[cfg(feature = "http3")]
         if self.client.inner.http3_enabled
             && let Some(origin) = Origin::from_uri(&uri_for_h3)
+            && let Some(body_bytes) = h3_body
         {
             let timeout = self.timeout.or(self.client.inner.default_timeout);
             let h3_request = request_for_http3(
                 self.method.clone(),
                 uri_for_h3.clone(),
-                request.headers().clone(),
+                req.headers_ref().cloned().unwrap_or_default(),
             )?;
-            let h3_attempt =
-                try_http3(&self.client, origin.clone(), h3_request, body_bytes.clone());
+            let h3_attempt = try_http3(&self.client, origin.clone(), h3_request, body_bytes);
             let h3_result = match timeout {
                 Some(d) => match tokio::time::timeout(d, h3_attempt).await {
                     Ok(result) => result,
@@ -190,6 +222,10 @@ impl RequestBuilder {
                 Err(err) => return Err(err),
             }
         }
+
+        let request = req
+            .body(self.body.into_body())
+            .map_err(|e| Error::Internal(format!("request build: {e}")))?;
 
         let timeout = self.timeout.or(self.client.inner.default_timeout);
         let send_fut = self.client.inner.hyper.request(request);
