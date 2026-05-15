@@ -24,7 +24,10 @@ pub(crate) struct Http3State {
 
 pub(crate) enum Http3AttemptError {
     Handshake(String),
-    Stream(Error),
+    Stream {
+        error: Error,
+        retry_without_h3: bool,
+    },
 }
 
 impl Http3State {
@@ -52,33 +55,37 @@ impl Http3State {
         };
 
         let mut sender = sender.lock().await;
-        let mut stream = sender
-            .send_request(request)
-            .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
+        let mut stream =
+            sender
+                .send_request(request)
+                .await
+                .map_err(|e| Http3AttemptError::Stream {
+                    error: Error::Cancelled(e.to_string()),
+                    retry_without_h3: true,
+                })?;
 
         if let Some(body) = body {
             stream
                 .send_data(body)
                 .await
-                .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
+                .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
         }
         stream
             .finish()
             .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
+            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
 
         let response = stream
             .recv_response()
             .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
+            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
         let (parts, ()) = response.into_parts();
 
         let mut body = BytesMut::new();
         while let Some(mut chunk) = stream
             .recv_data()
             .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?
+            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?
         {
             let remaining = chunk.remaining();
             body.extend_from_slice(&chunk.copy_to_bytes(remaining));
@@ -124,6 +131,12 @@ impl Http3State {
         Ok(send_request)
     }
 
+    pub(crate) fn remove_connection(&self, origin: &Origin) {
+        if let Ok(mut guard) = self.connections.lock() {
+            guard.remove(origin);
+        }
+    }
+
     fn endpoint(&self) -> std::result::Result<quinn::Endpoint, String> {
         let mut guard = self
             .endpoint
@@ -162,3 +175,9 @@ async fn first_socket_addr(
         .ok_or_else(|| format!("no socket addresses for {host}:{port}"))
 }
 
+fn stream_error_after_request_started(error: Error) -> Http3AttemptError {
+    Http3AttemptError::Stream {
+        error,
+        retry_without_h3: false,
+    }
+}

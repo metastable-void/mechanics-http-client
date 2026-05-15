@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.2.4] - 2026-05-15
+
+### Fixed (mildly breaking on the internal `Http3AttemptError`)
+- `try_http3` failures now distinguish "no wire bytes sent
+  yet, safe to fall back to h1/h2" from "request started on
+  the wire, retrying would be a duplicate." `Http3AttemptError::Stream`
+  is now a struct variant `{ error, retry_without_h3 }`:
+  - `send_request` failures (handshake completed, but the
+    server rejected before reading any request bytes) carry
+    `retry_without_h3 = true` — `try_http3` then evicts the
+    cached h3 connection, inserts a negative-cache entry,
+    and returns `Ok(None)` so the caller transparently falls
+    through to the h1/h2 path. This is the case the
+    `mhc 0.2.3` operator hit when `Error: request cancelled`
+    propagated all the way to the JS layer instead of
+    silently degrading to HTTP/2 over TLS.
+  - `send_data` / `finish` / `recv_response` / `recv_data`
+    failures carry `retry_without_h3 = false`. The request
+    is already on the wire; falling back would send a
+    duplicate, so the error propagates.
+- `try_http3` also evicts the cached h3 connection on any
+  stream-level error (both retry-paths) and inserts a
+  negative-cache entry so the next request to the same
+  origin skips h3 for a while.
+- Added a per-attempt timeout for the h3 path so an h3
+  handshake or stream that never completes can't block the
+  whole request indefinitely.
+
+`Http3AttemptError` is an internal-only `pub(crate)` enum, so
+this variant reshape is not a SemVer break of the public
+surface; tracking the change here for the audit trail.
+
 ## [0.2.3] - 2026-05-15
 
 ### Changed (mildly breaking; no in-workspace pattern matchers)

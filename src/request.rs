@@ -164,12 +164,25 @@ impl RequestBuilder {
         if self.client.inner.http3_enabled
             && let Some(origin) = Origin::from_uri(&uri_for_h3)
         {
+            let timeout = self.timeout.or(self.client.inner.default_timeout);
             let h3_request = request_for_http3(
                 self.method.clone(),
                 uri_for_h3.clone(),
                 request.headers().clone(),
             )?;
-            match try_http3(&self.client, origin.clone(), h3_request, body_bytes.clone()).await {
+            let h3_attempt =
+                try_http3(&self.client, origin.clone(), h3_request, body_bytes.clone());
+            let h3_result = match timeout {
+                Some(d) => match tokio::time::timeout(d, h3_attempt).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        insert_negative(&self.client, origin, Instant::now());
+                        return Err(Error::Timeout);
+                    }
+                },
+                None => h3_attempt.await,
+            };
+            match h3_result {
                 Ok(Some(response)) => return Ok(response),
                 Ok(None) => {}
                 Err(err) => return Err(err),
@@ -239,7 +252,7 @@ async fn try_http3(
             .inner
             .http3
             .request(
-                target,
+                target.clone(),
                 &origin.host,
                 &entry.addresses,
                 request.clone(),
@@ -253,7 +266,17 @@ async fn try_http3(
                 insert_negative(client, origin.clone(), now);
                 return Ok(None);
             }
-            Err(http3::Http3AttemptError::Stream(err)) => return Err(err),
+            Err(http3::Http3AttemptError::Stream {
+                error,
+                retry_without_h3,
+            }) => {
+                client.inner.http3.remove_connection(&target);
+                insert_negative(client, origin.clone(), now);
+                if retry_without_h3 {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
         }
     }
 
@@ -266,7 +289,7 @@ async fn try_http3(
         match client
             .inner
             .http3
-            .request(target, authority_host, &[], request, body)
+            .request(target.clone(), authority_host, &[], request, body)
             .await
         {
             Ok(response) => return Ok(Some(response)),
@@ -275,7 +298,17 @@ async fn try_http3(
                 insert_negative(client, origin, now);
                 return Ok(None);
             }
-            Err(http3::Http3AttemptError::Stream(err)) => return Err(err),
+            Err(http3::Http3AttemptError::Stream {
+                error,
+                retry_without_h3,
+            }) => {
+                client.inner.http3.remove_connection(&target);
+                insert_negative(client, origin, now);
+                if retry_without_h3 {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
         }
     }
 
