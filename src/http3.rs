@@ -1,11 +1,15 @@
 //! Opportunistic HTTP/3 over QUIC.
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use http::{Request, Response as HttpResponse};
+use http_body::Frame;
 use quinn::crypto::rustls::QuicClientConfig;
 
 use crate::client::Origin;
@@ -14,11 +18,16 @@ use crate::response::Response;
 use crate::tls;
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+type H3RequestStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+type RecvDataFuture =
+    Pin<Box<dyn Future<Output = (Box<H3RequestStream>, Result<Option<Bytes>, Error>)> + Send>>;
 
 const H3_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const H3_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const H3_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const H3_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_millis(150);
 const H3_STREAM_OPEN_TIMEOUT: Duration = Duration::from_millis(150);
+const H3_STREAM_UPLOAD_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// HTTP/3 endpoint state owned by a [`Client`](crate::Client).
 pub(crate) struct Http3State {
@@ -70,35 +79,24 @@ impl Http3State {
             })?;
 
         if let Some(body) = body {
-            stream
-                .send_data(body)
-                .await
-                .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
+            h3_stream_phase(
+                H3_STREAM_UPLOAD_TIMEOUT,
+                "request body send",
+                stream.send_data(body),
+            )
+            .await?;
         }
-        stream
-            .finish()
-            .await
-            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
+        h3_stream_phase(H3_STREAM_UPLOAD_TIMEOUT, "request finish", stream.finish()).await?;
 
         let response = stream
             .recv_response()
             .await
             .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
         let (parts, ()) = response.into_parts();
-
-        let mut body = BytesMut::new();
-        while let Some(mut chunk) = stream
-            .recv_data()
-            .await
-            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?
-        {
-            let remaining = chunk.remaining();
-            body.extend_from_slice(&chunk.copy_to_bytes(remaining));
-        }
-        Ok(Response::new_buffered(HttpResponse::from_parts(
-            parts,
-            body.freeze(),
-        )))
+        Ok(Response::new_h3(
+            HttpResponse::from_parts(parts, ()),
+            H3ResponseBody::new(stream),
+        ))
     }
 
     async fn connection(
@@ -151,6 +149,84 @@ impl Http3State {
     }
 }
 
+/// Streaming HTTP/3 response body backed by an h3 client request stream.
+pub(crate) struct H3ResponseBody {
+    state: H3ResponseBodyState,
+}
+
+enum H3ResponseBodyState {
+    Ready(Option<Box<H3RequestStream>>),
+    Reading(RecvDataFuture),
+    Done,
+}
+
+impl std::fmt::Debug for H3ResponseBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("H3ResponseBody").finish_non_exhaustive()
+    }
+}
+
+impl H3ResponseBody {
+    fn new(stream: H3RequestStream) -> Self {
+        Self {
+            state: H3ResponseBodyState::Ready(Some(Box::new(stream))),
+        }
+    }
+}
+
+impl http_body::Body for H3ResponseBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        loop {
+            match &mut this.state {
+                H3ResponseBodyState::Ready(stream) => {
+                    let Some(mut stream) = stream.take() else {
+                        this.state = H3ResponseBodyState::Done;
+                        continue;
+                    };
+                    this.state = H3ResponseBodyState::Reading(Box::pin(async move {
+                        let result = stream
+                            .recv_data()
+                            .await
+                            .map_err(|e| Error::Cancelled(e.to_string()))
+                            .map(|chunk| {
+                                chunk.map(|mut chunk| {
+                                    let remaining = chunk.remaining();
+                                    chunk.copy_to_bytes(remaining)
+                                })
+                            });
+                        (stream, result)
+                    }));
+                }
+                H3ResponseBodyState::Reading(future) => {
+                    let (stream, result) = std::task::ready!(future.as_mut().poll(cx));
+                    match result {
+                        Ok(Some(bytes)) => {
+                            this.state = H3ResponseBodyState::Ready(Some(stream));
+                            return Poll::Ready(Some(Ok(Frame::data(bytes))));
+                        }
+                        Ok(None) => {
+                            this.state = H3ResponseBodyState::Done;
+                            return Poll::Ready(None);
+                        }
+                        Err(error) => {
+                            this.state = H3ResponseBodyState::Done;
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                }
+                H3ResponseBodyState::Done => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
 async fn first_socket_addr(
     host: &str,
     port: u16,
@@ -160,12 +236,32 @@ async fn first_socket_addr(
         return Ok(SocketAddr::new(addr, port));
     }
 
-    let mut addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut addrs =
+        tokio::time::timeout(H3_DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| format!("HTTP/3 DNS lookup timed out after {H3_DNS_LOOKUP_TIMEOUT:?}"))?
+            .map_err(|e| e.to_string())?;
     addrs
         .next()
         .ok_or_else(|| format!("no socket addresses for {host}:{port}"))
+}
+
+async fn h3_stream_phase<T, E>(
+    timeout: Duration,
+    phase: &'static str,
+    future: impl Future<Output = std::result::Result<T, E>>,
+) -> std::result::Result<T, Http3AttemptError>
+where
+    E: std::fmt::Display,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| stream_error_after_request_started(Error::Timeout))?
+        .map_err(|e| {
+            stream_error_after_request_started(Error::Cancelled(format!(
+                "HTTP/3 {phase} failed: {e}"
+            )))
+        })
 }
 
 fn stream_error_after_request_started(error: Error) -> Http3AttemptError {

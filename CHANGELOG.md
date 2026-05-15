@@ -59,6 +59,35 @@
   `https_rr::lookup` DNS probe. Slow DNS no longer blocks
   the H3 attempt; lookup-timeout falls through to the
   TCP-HTTPS path.
+- 150 ms `H3_DNS_LOOKUP_TIMEOUT` wraps the fallback
+  `tokio::net::lookup_host` resolution used when the H3
+  target host isn't already an IP literal and the
+  Alt-Svc / HTTPS-RR records gave a host name rather than
+  an address. Previously this was unbounded — a slow
+  system resolver could stall the H3 attempt for the full
+  outer mechanics timeout; now it surfaces as a handshake-
+  level failure that falls back to TCP HTTPS via the
+  existing retry / negative-cache path.
+- 500 ms `H3_STREAM_UPLOAD_TIMEOUT` wraps both
+  `stream.send_data()` (request body upload) and
+  `stream.finish()` (request half-close) via a new
+  `h3_stream_phase` helper. Previously these were
+  unbounded — a peer that ACKed the stream open but stopped
+  reading could hang the entire request indefinitely; now
+  the request fails with
+  `Error::Cancelled { retry_without_h3: false }` so the
+  request is not duplicated on h1/h2 (already on the
+  wire), with the phase name ("request body send" /
+  "request finish") in the error string for operator
+  diagnosis.
+- 3 s `DEFAULT_CONNECT_TIMEOUT` set on the underlying
+  `hyper_util::HttpConnector` for the h1/h2/HTTPS path.
+  Previously the TCP `connect()` was bounded only by the
+  OS-level handshake timeout (typically 30–75 s) plus the
+  outer mechanics timeout; now a black-holed peer surfaces
+  as `Error::Unreachable` quickly enough for the
+  support-chat path to render a recoverable error to the
+  user instead of stalling for minutes.
 - `try_http3` checks cached Alt-Svc **before** HTTPS-RR
   lookup. Second-and-later requests to an origin that
   already advertised `Alt-Svc: h3=...` on the first
@@ -74,6 +103,21 @@
   response body into a stuck mechanics endpoint future. The
   caller has no trailer API surface, so this is a pure
   behaviour fix — no API change.
+- **H3 response body now streams.** Previously, the H3 path
+  buffered every DATA frame into a `BytesMut` before
+  constructing a `Response`, so an H3 caller had to wait for
+  upstream EOF before even reading response headers — the
+  symmetric mistake the connector-router forwarder fix
+  already corrected on the h1/h2 buffering side. A new
+  internal `H3ResponseBody` type implements
+  `http_body::Body<Data = Bytes, Error = Error>`, polling
+  each `recv_data` call as its own DATA frame; `Response`
+  now carries either `Hyper(Incoming)` (h1/h2) or
+  `H3(Box<H3ResponseBody>)` (h3) and flows both through
+  `bytes()` / `bytes_with_cap()` / `into_body()` identically.
+  Streaming forwarders (`connector-router` `HyperForwarder`)
+  now get the same headers-first-then-DATA-as-it-arrives
+  behaviour on H3 that they already get on h1/h2.
 
 ### Added
 - `RequestBuilder::body_streaming(body)` accepts any

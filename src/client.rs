@@ -20,6 +20,8 @@ use crate::tls;
 #[cfg(feature = "http3")]
 use crate::{alt_svc, http3, https_rr};
 
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Type alias for the hyper-util client backing each [`Client`].
 pub(crate) type HyperClient = HyperLegacyClient<HttpsConnector<HttpConnector>, RequestBody>;
 
@@ -292,6 +294,7 @@ impl ClientBuilder {
 
         let mut http = HttpConnector::new();
         http.enforce_http(false);
+        http.set_connect_timeout(Some(DEFAULT_CONNECT_TIMEOUT));
 
         let https = HttpsConnectorBuilder::new()
             .with_tls_config(tls_config)

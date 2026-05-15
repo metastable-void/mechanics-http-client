@@ -4,13 +4,12 @@
 //! `json` paths. `bytes_with_cap` caps **wire bytes** (post-TLS,
 //! pre-decompression).
 
-use std::convert::Infallible;
 use std::io::Read;
 
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, StatusCode, Version};
+use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full};
 use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
@@ -28,7 +27,7 @@ pub struct Response {
 enum ResponseBody {
     Hyper(hyper::body::Incoming),
     #[cfg(feature = "http3")]
-    Buffered(Bytes),
+    H3(Box<crate::http3::H3ResponseBody>),
 }
 
 impl Response {
@@ -41,11 +40,11 @@ impl Response {
     }
 
     #[cfg(feature = "http3")]
-    pub(crate) fn new_buffered(response: http::Response<Bytes>) -> Self {
-        let (parts, body) = response.into_parts();
+    pub(crate) fn new_h3(response: http::Response<()>, body: crate::http3::H3ResponseBody) -> Self {
+        let (parts, ()) = response.into_parts();
         Self {
             parts,
-            body: Some(ResponseBody::Buffered(body)),
+            body: Some(ResponseBody::H3(Box::new(body))),
         }
     }
 
@@ -93,9 +92,7 @@ impl Response {
         let body = match body {
             ResponseBody::Hyper(body) => body.map_err(map_hyper_body_error).boxed_unsync(),
             #[cfg(feature = "http3")]
-            ResponseBody::Buffered(body) => Full::new(body)
-                .map_err(|error: Infallible| match error {})
-                .boxed_unsync(),
+            ResponseBody::H3(body) => (*body).boxed_unsync(),
         };
         Ok(body)
     }
@@ -113,15 +110,7 @@ impl Response {
         let raw = match body {
             ResponseBody::Hyper(body) => collect_body_with_cap(body, max_wire_bytes).await?,
             #[cfg(feature = "http3")]
-            ResponseBody::Buffered(body) => {
-                if body.len() > max_wire_bytes {
-                    return Err(Error::BodyTooLarge {
-                        limit: max_wire_bytes,
-                        seen: max_wire_bytes,
-                    });
-                }
-                body
-            }
+            ResponseBody::H3(body) => collect_mhc_body_with_cap(*body, max_wire_bytes).await?,
         };
         decompress(
             self.parts
@@ -170,6 +159,33 @@ async fn collect_body_with_cap(mut body: hyper::body::Incoming, max_bytes: usize
             Some(Err(e)) => {
                 return Err(map_hyper_body_error(e));
             }
+        }
+    }
+    Ok(buf.freeze())
+}
+
+#[cfg(feature = "http3")]
+async fn collect_mhc_body_with_cap<B>(mut body: B, max_bytes: usize) -> Result<Bytes>
+where
+    B: http_body::Body<Data = Bytes, Error = Error> + Unpin,
+{
+    let mut buf = BytesMut::new();
+    loop {
+        match body.frame().await {
+            None => break,
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    let new_total = buf.len().saturating_add(data.len());
+                    if new_total > max_bytes {
+                        return Err(Error::BodyTooLarge {
+                            limit: max_bytes,
+                            seen: buf.len(),
+                        });
+                    }
+                    buf.extend_from_slice(&data);
+                }
+            }
+            Some(Err(e)) => return Err(e),
         }
     }
     Ok(buf.freeze())
