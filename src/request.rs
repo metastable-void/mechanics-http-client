@@ -2,6 +2,8 @@
 //! reqwest's surface for the subset of operations the workspace's
 //! call sites actually need.
 
+#[cfg(feature = "http3")]
+use std::net::IpAddr;
 use std::time::Duration;
 #[cfg(feature = "http3")]
 use std::time::Instant;
@@ -248,35 +250,17 @@ async fn try_http3(
     {
         let mut target = origin.clone();
         target.port = entry.port;
-        match client
-            .inner
-            .http3
-            .request(
-                target.clone(),
-                &origin.host,
-                &entry.addresses,
-                request.clone(),
-                body.clone(),
-            )
-            .await
+        let target = Http3RequestTarget {
+            origin: &origin,
+            target,
+            authority_host: &origin.host,
+            addresses: &entry.addresses,
+        };
+        if let Some(response) =
+            request_http3_with_stale_retry(client, target, request.clone(), body.clone(), now)
+                .await?
         {
-            Ok(response) => return Ok(Some(response)),
-            Err(http3::Http3AttemptError::Handshake(message)) => {
-                let _ = message;
-                insert_negative(client, origin.clone(), now);
-                return Ok(None);
-            }
-            Err(http3::Http3AttemptError::Stream {
-                error,
-                retry_without_h3,
-            }) => {
-                client.inner.http3.remove_connection(&target);
-                insert_negative(client, origin.clone(), now);
-                if retry_without_h3 {
-                    return Ok(None);
-                }
-                return Err(error);
-            }
+            return Ok(Some(response));
         }
     }
 
@@ -286,24 +270,66 @@ async fn try_http3(
             host: authority_host.to_owned(),
             port: entry.port,
         };
+        let target = Http3RequestTarget {
+            origin: &origin,
+            target,
+            authority_host,
+            addresses: &[],
+        };
+        if let Some(response) =
+            request_http3_with_stale_retry(client, target, request, body, now).await?
+        {
+            return Ok(Some(response));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "http3")]
+struct Http3RequestTarget<'a> {
+    origin: &'a Origin,
+    target: Origin,
+    authority_host: &'a str,
+    addresses: &'a [IpAddr],
+}
+
+#[cfg(feature = "http3")]
+async fn request_http3_with_stale_retry(
+    client: &Client,
+    target: Http3RequestTarget<'_>,
+    request: Request<()>,
+    body: Option<Bytes>,
+    now: Instant,
+) -> Result<Option<Response>> {
+    for attempt in 0..2 {
         match client
             .inner
             .http3
-            .request(target.clone(), authority_host, &[], request, body)
+            .request(
+                target.target.clone(),
+                target.authority_host,
+                target.addresses,
+                request.clone(),
+                body.clone(),
+            )
             .await
         {
             Ok(response) => return Ok(Some(response)),
             Err(http3::Http3AttemptError::Handshake(message)) => {
                 let _ = message;
-                insert_negative(client, origin, now);
+                insert_negative(client, target.origin.clone(), now);
                 return Ok(None);
             }
             Err(http3::Http3AttemptError::Stream {
                 error,
                 retry_without_h3,
             }) => {
-                client.inner.http3.remove_connection(&target);
-                insert_negative(client, origin, now);
+                client.inner.http3.remove_connection(&target.target);
+                if retry_without_h3 && attempt == 0 {
+                    continue;
+                }
+                insert_negative(client, target.origin.clone(), now);
                 if retry_without_h3 {
                     return Ok(None);
                 }
@@ -312,6 +338,7 @@ async fn try_http3(
         }
     }
 
+    insert_negative(client, target.origin.clone(), now);
     Ok(None)
 }
 

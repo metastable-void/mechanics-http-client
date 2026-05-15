@@ -2,6 +2,28 @@
 
 ## [0.2.4] - 2026-05-15
 
+### Fixed
+- QUIC client transport config now sets
+  `keep_alive_interval = 15s` and `max_idle_timeout = 120s`.
+  Without keep-alives the QUIC connection silently dies at
+  NAT / stateful-firewall idle-eviction (typically 30-60s),
+  and the next request through the cached h3 connection
+  surfaces as `Error::Cancelled` with no recovery path. Pairs
+  with the matching mhs 0.1.4 server-side setting.
+- New `request_http3_with_stale_retry` helper: when an h3
+  attempt against a CACHED connection fails on a pre-wire
+  `send_request` (cached connection went stale between
+  requests), `try_http3` now transparently re-handshakes a
+  fresh h3 connection and retries ONCE before falling through
+  to h1/h2. The negative-cache insertion is deferred until
+  after both attempts fail, so a one-off stale-connection
+  hiccup doesn't poison the origin for the negative-cache
+  TTL.
+- The HTTPS-RR and Alt-Svc branches in `try_http3` now share
+  this retry helper instead of duplicating the
+  match-on-Http3AttemptError arms. Same behaviour, less
+  drift surface.
+
 ### Fixed (mildly breaking on the internal `Http3AttemptError`)
 - `try_http3` failures now distinguish "no wire bytes sent
   yet, safe to fall back to h1/h2" from "request started on

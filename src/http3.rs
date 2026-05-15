@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use http::{Request, Response as HttpResponse};
@@ -15,6 +16,9 @@ use crate::response::Response;
 use crate::tls;
 
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
+
+const H3_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const H3_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Cached HTTP/3 transport state owned by a [`Client`](crate::Client).
 pub(crate) struct Http3State {
@@ -149,7 +153,8 @@ impl Http3State {
         let mut tls_config = tls::webpki_roots_client_config().map_err(|e| e.to_string())?;
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
         let quic_config = QuicClientConfig::try_from(tls_config).map_err(|e| e.to_string())?;
-        let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+        client_config.transport_config(Arc::new(h3_transport_config()?));
         let bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
         let mut endpoint = quinn::Endpoint::client(bind).map_err(|e| e.to_string())?;
         endpoint.set_default_client_config(client_config);
@@ -180,4 +185,14 @@ fn stream_error_after_request_started(error: Error) -> Http3AttemptError {
         error,
         retry_without_h3: false,
     }
+}
+
+fn h3_transport_config() -> std::result::Result<quinn::TransportConfig, String> {
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .keep_alive_interval(Some(H3_KEEP_ALIVE_INTERVAL))
+        .max_idle_timeout(Some(
+            H3_MAX_IDLE_TIMEOUT.try_into().map_err(|e| format!("{e}"))?,
+        ));
+    Ok(transport)
 }
