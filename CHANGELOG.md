@@ -23,12 +23,32 @@
   this retry helper instead of duplicating the
   match-on-Http3AttemptError arms. Same behaviour, less
   drift surface.
-- 3-second timeout (`H3_CONNECT_TIMEOUT`) wraps both
+- 500 ms `H3_CONNECT_TIMEOUT` wraps both
   `quinn::Endpoint::connect().await` and
   `h3::client::builder().build(quic).await` so a half-finished
   QUIC handshake or h3-setup can't block the request
   indefinitely; on timeout the request falls back to h1/h2
-  via the existing retry / negative-cache path.
+  via the existing retry / negative-cache path. Tightened from
+  3 s — the support-chat path must fall back quickly when H3
+  is stale or unreachable.
+- 150 ms `H3_STREAM_OPEN_TIMEOUT` wraps
+  `sender.send_request()`. A cached `h3::client::SendRequest`
+  whose underlying QUIC connection has gone stale can hang on
+  the bidi-stream-open step — pre-wire, no bytes ever sent —
+  and consume the full outer mechanics timeout. The new
+  bound surfaces a stale sender as
+  `Error::Cancelled { retry_without_h3: true }`, identical
+  to an immediate stream-open failure: cached connection
+  evicted, fresh H3 retry attempted, then TCP fallback.
+- 150 ms `H3_HTTPS_RR_LOOKUP_TIMEOUT` wraps the
+  `https_rr::lookup` DNS probe. Slow DNS no longer blocks
+  the H3 attempt; lookup-timeout falls through to the
+  TCP-HTTPS path.
+- `try_http3` now checks cached Alt-Svc **before** HTTPS-RR
+  lookup. Second-and-later requests to an origin that
+  already advertised `Alt-Svc: h3=...` on the first
+  response skip the DNS probe entirely. (HTTPS-RR is still
+  checked as a fallback when no Alt-Svc entry is cached.)
 - Cached `h3::client::SendRequest` mutex is now released as
   soon as `send_request` returns the stream, rather than
   being held for the lifetime of the stream. Concurrent

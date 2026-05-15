@@ -21,6 +21,9 @@ use crate::response::Response;
 #[cfg(feature = "http3")]
 use crate::{alt_svc, http3, https_rr};
 
+#[cfg(feature = "http3")]
+const H3_HTTPS_RR_LOOKUP_TIMEOUT: Duration = Duration::from_millis(150);
+
 /// Chainable per-request builder. Construct via [`Client::get`] /
 /// [`Client::post`] / [`Client::request`] / etc.
 ///
@@ -281,25 +284,6 @@ async fn try_http3(
         return Ok(None);
     }
 
-    if let Some(entry) = https_rr_entry(client, &origin, now).await
-        && entry.has_h3
-    {
-        let mut target = origin.clone();
-        target.port = entry.port;
-        let target = Http3RequestTarget {
-            origin: &origin,
-            target,
-            authority_host: &origin.host,
-            addresses: &entry.addresses,
-        };
-        if let Some(response) =
-            request_http3_with_stale_retry(client, target, request.clone(), body.clone(), now)
-                .await?
-        {
-            return Ok(Some(response));
-        }
-    }
-
     if let Some(entry) = alt_svc_entry(client, &origin, now) {
         let authority_host = entry.host.as_deref().unwrap_or(origin.host.as_str());
         let target = Origin {
@@ -311,6 +295,25 @@ async fn try_http3(
             target,
             authority_host,
             addresses: &[],
+        };
+        if let Some(response) =
+            request_http3_with_stale_retry(client, target, request.clone(), body.clone(), now)
+                .await?
+        {
+            return Ok(Some(response));
+        }
+    }
+
+    if let Some(entry) = https_rr_entry(client, &origin, now).await
+        && entry.has_h3
+    {
+        let mut target = origin.clone();
+        target.port = entry.port;
+        let target = Http3RequestTarget {
+            origin: &origin,
+            target,
+            authority_host: &origin.host,
+            addresses: &entry.addresses,
         };
         if let Some(response) =
             request_http3_with_stale_retry(client, target, request, body, now).await?
@@ -393,14 +396,18 @@ async fn https_rr_entry(
         cache.remove(origin);
     }
 
-    match https_rr::lookup(origin).await {
-        Ok(Some(entry)) => {
-            if let Ok(mut cache) = client.inner.https_rr_cache.write() {
-                cache.insert(origin.clone(), entry.clone());
+    let lookup = tokio::time::timeout(H3_HTTPS_RR_LOOKUP_TIMEOUT, https_rr::lookup(origin)).await;
+    match lookup {
+        Err(_) => None,
+        Ok(result) => match result {
+            Ok(Some(entry)) => {
+                if let Ok(mut cache) = client.inner.https_rr_cache.write() {
+                    cache.insert(origin.clone(), entry.clone());
+                }
+                Some(entry)
             }
-            Some(entry)
-        }
-        Ok(None) | Err(_) => None,
+            Ok(None) | Err(_) => None,
+        },
     }
 }
 

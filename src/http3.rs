@@ -19,7 +19,8 @@ type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
 const H3_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const H3_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const H3_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const H3_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const H3_STREAM_OPEN_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Cached HTTP/3 transport state owned by a [`Client`](crate::Client).
 pub(crate) struct Http3State {
@@ -61,9 +62,14 @@ impl Http3State {
 
         let mut stream = {
             let mut sender = sender.lock().await;
-            sender
-                .send_request(request)
+            tokio::time::timeout(H3_STREAM_OPEN_TIMEOUT, sender.send_request(request))
                 .await
+                .map_err(|_| Http3AttemptError::Stream {
+                    error: Error::Cancelled(format!(
+                        "HTTP/3 request stream open timed out after {H3_STREAM_OPEN_TIMEOUT:?}"
+                    )),
+                    retry_without_h3: true,
+                })?
                 .map_err(|e| Http3AttemptError::Stream {
                     error: Error::Cancelled(e.to_string()),
                     retry_without_h3: true,
