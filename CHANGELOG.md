@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.3] - 2026-05-15
+
+### Changed (mildly breaking; no in-workspace pattern matchers)
+- `Error::Cancelled` now carries a `String` detail. Display is
+  `"request cancelled: <detail>"`. Previously it was a unit
+  variant whose Display was just `"request cancelled"`, hiding
+  the underlying hyper / h3 reason from operators — the
+  symptom "Error: request cancelled" with no further context
+  is exactly what an api-server operator hit on 2026-05-14
+  when the connector-router's plain-HTTP forwarder triggered
+  a peer-side stream close mid-response. The detail now
+  surfaces hyper's actual message ("connection closed before
+  message completed", "stream cancel from peer", etc.) so the
+  next diagnostic round doesn't need a guess-and-recompile
+  loop.
+- Removed the (dead) `ErrorWithMessage` trait that
+  special-cased `Cancelled` to drop the message it claimed to
+  attach. The h3 emission sites now construct
+  `Error::Cancelled(e.to_string())` directly.
+
 ## [0.2.2] - 2026-05-14
 
 ### Changed

@@ -81,9 +81,13 @@ pub enum Error {
     SerializeJson(String),
 
     /// The connection was cancelled mid-flight (e.g. peer reset,
-    /// HTTP/2 GOAWAY).
-    #[error("request cancelled")]
-    Cancelled,
+    /// HTTP/2 GOAWAY, HTTP/3 STOP_SENDING). The string carries the
+    /// underlying hyper / h3 error message so operators can
+    /// distinguish "stream cancel from peer" from "connection
+    /// closed before message completed" from "stop_sending from
+    /// peer", etc.
+    #[error("request cancelled: {0}")]
+    Cancelled(String),
 
     /// Catch-all for client-construction or hyper-internal errors
     /// that don't map cleanly to the variants above.

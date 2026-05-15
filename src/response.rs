@@ -150,7 +150,7 @@ async fn collect_body_with_cap(mut body: hyper::body::Incoming, max_bytes: usize
                 let message = e.to_string();
                 let lower = message.to_lowercase();
                 if lower.contains("canceled") || lower.contains("cancelled") {
-                    return Err(Error::Cancelled);
+                    return Err(Error::Cancelled(message));
                 }
                 return Err(Error::Unreachable(message));
             }

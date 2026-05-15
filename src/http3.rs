@@ -55,30 +55,30 @@ impl Http3State {
         let mut stream = sender
             .send_request(request)
             .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled.with_message(e)))?;
+            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
 
         if let Some(body) = body {
             stream
                 .send_data(body)
                 .await
-                .map_err(|e| Http3AttemptError::Stream(Error::Cancelled.with_message(e)))?;
+                .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
         }
         stream
             .finish()
             .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled.with_message(e)))?;
+            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
 
         let response = stream
             .recv_response()
             .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled.with_message(e)))?;
+            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?;
         let (parts, ()) = response.into_parts();
 
         let mut body = BytesMut::new();
         while let Some(mut chunk) = stream
             .recv_data()
             .await
-            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled.with_message(e)))?
+            .map_err(|e| Http3AttemptError::Stream(Error::Cancelled(e.to_string())))?
         {
             let remaining = chunk.remaining();
             body.extend_from_slice(&chunk.copy_to_bytes(remaining));
@@ -162,15 +162,3 @@ async fn first_socket_addr(
         .ok_or_else(|| format!("no socket addresses for {host}:{port}"))
 }
 
-trait ErrorWithMessage {
-    fn with_message(self, message: impl std::fmt::Display) -> Self;
-}
-
-impl ErrorWithMessage for Error {
-    fn with_message(self, message: impl std::fmt::Display) -> Self {
-        match self {
-            Error::Cancelled => Error::Cancelled,
-            other => Error::Internal(format!("{other}: {message}")),
-        }
-    }
-}
