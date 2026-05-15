@@ -364,7 +364,6 @@ async fn request_http3_with_stale_retry(
                 error,
                 retry_without_h3,
             }) => {
-                client.inner.http3.remove_connection(&target.target);
                 if retry_without_h3 && attempt == 0 {
                     continue;
                 }

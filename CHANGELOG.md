@@ -3,25 +3,42 @@
 ## [0.2.4] - 2026-05-15
 
 ### Fixed
-- QUIC client transport config now sets
-  `keep_alive_interval = 15s` and `max_idle_timeout = 120s`.
-  Without keep-alives the QUIC connection silently dies at
-  NAT / stateful-firewall idle-eviction (typically 30-60s),
-  and the next request through the cached h3 connection
-  surfaces as `Error::Cancelled` with no recovery path. Pairs
-  with the matching mhs 0.1.4 server-side setting.
-- New `request_http3_with_stale_retry` helper: when an h3
-  attempt against a CACHED connection fails on a pre-wire
-  `send_request` (cached connection went stale between
-  requests), `try_http3` now transparently re-handshakes a
-  fresh h3 connection and retries ONCE before falling through
-  to h1/h2. The negative-cache insertion is deferred until
-  after both attempts fail, so a one-off stale-connection
-  hiccup doesn't poison the origin for the negative-cache
-  TTL.
-- The HTTPS-RR and Alt-Svc branches in `try_http3` now share
-  this retry helper instead of duplicating the
-  match-on-Http3AttemptError arms. Same behaviour, less
+- **H3 connections are now per-request disposable.** The
+  per-origin cached `Arc<AsyncMutex<H3SendRequest>>` table is
+  gone; every H3 attempt builds a fresh QUIC connection and a
+  fresh `h3::client` against the (still cached) QUIC endpoint,
+  uses it for one request, then lets the driver task wind it
+  down. This removes the entire class of "non-first request
+  against a stale cached H3 sender" failures (`Error::Cancelled`
+  before any wire bytes are sent, concurrent jobs serialised on
+  one sender's mutex, response-stream-unfinished hang on
+  reuse) at the cost of one extra QUIC handshake per H3 request.
+  For the support-chat path that trade is well worth it — chat
+  flows are dominated by the round-trip to the LLM provider,
+  not by the local connect cost; for the connector-router
+  hop the cost is loopback-latency anyway. The QUIC endpoint
+  itself is still cached, so the rustls / crypto-provider /
+  UDP-socket setup happens once per `Client`.
+- QUIC client transport config sets `keep_alive_interval = 15s`
+  and `max_idle_timeout = 120s` on the still-cached QUIC
+  endpoint. With per-request H3 connections, keep-alives
+  matter mostly for streaming responses that span the 30–60 s
+  NAT-state TTL window; the longer max-idle prevents the
+  driver task from spuriously closing a connection that's
+  still in active use. Pairs with the matching mhs 0.1.4
+  server-side setting.
+- `request_http3_with_stale_retry` retries an H3 attempt once
+  when the first attempt fails pre-wire (handshake completed,
+  `send_request` rejected before reading any request bytes,
+  `retry_without_h3 = true`). The retry opens an independent
+  fresh QUIC + H3 connection — no cache to evict, no shared
+  state between attempts — and falls through to h1/h2 if it
+  also fails. Negative-cache insertion is deferred until
+  both attempts fail, so a one-off pre-wire hiccup doesn't
+  poison the origin for the negative-cache TTL.
+- The HTTPS-RR and Alt-Svc branches in `try_http3` share this
+  retry helper instead of duplicating the
+  match-on-`Http3AttemptError` arms. Same behaviour, less
   drift surface.
 - 500 ms `H3_CONNECT_TIMEOUT` wraps both
   `quinn::Endpoint::connect().await` and
@@ -31,45 +48,32 @@
   via the existing retry / negative-cache path. Tightened from
   3 s — the support-chat path must fall back quickly when H3
   is stale or unreachable.
-- 150 ms `H3_STREAM_OPEN_TIMEOUT` wraps both **the cached
-  sender mutex acquisition** and the subsequent
-  `sender.send_request()` call. A cached
-  `h3::client::SendRequest` whose underlying QUIC connection
-  has gone stale can hang on the bidi-stream-open step —
-  pre-wire, no bytes ever sent — and consume the full outer
-  mechanics timeout. Wrapping the mutex acquisition as well
-  means a *concurrent* in-flight stream-open against the same
-  cached sender can't block a second mechanics job-task for
-  the full outer endpoint timeout either: if the lock isn't
-  available within 150 ms, the second task short-circuits to
-  the same retry/fallback path. The new bound surfaces a
-  stale sender as
-  `Error::Cancelled { retry_without_h3: true }`, identical
-  to an immediate stream-open failure: cached connection
-  evicted, fresh H3 retry attempted, then TCP fallback.
+- 150 ms `H3_STREAM_OPEN_TIMEOUT` wraps `send_request()`. A
+  fresh `h3::client::SendRequest` that hangs on the
+  bidi-stream-open step (pre-wire, no bytes ever sent)
+  surfaces as `Error::Cancelled { retry_without_h3: true }`,
+  identical to an immediate stream-open failure: fresh H3
+  retry attempted, then TCP fallback. With no cached sender
+  mutex, there's no lock-acquisition latency to bound.
 - 150 ms `H3_HTTPS_RR_LOOKUP_TIMEOUT` wraps the
   `https_rr::lookup` DNS probe. Slow DNS no longer blocks
   the H3 attempt; lookup-timeout falls through to the
   TCP-HTTPS path.
-- `try_http3` now checks cached Alt-Svc **before** HTTPS-RR
+- `try_http3` checks cached Alt-Svc **before** HTTPS-RR
   lookup. Second-and-later requests to an origin that
   already advertised `Alt-Svc: h3=...` on the first
   response skip the DNS probe entirely. (HTTPS-RR is still
   checked as a fallback when no Alt-Svc entry is cached.)
-- Cached `h3::client::SendRequest` mutex is now released as
-  soon as `send_request` returns the stream, rather than
-  being held for the lifetime of the stream. Concurrent
-  requests against the same cached h3 connection no longer
-  serialise on stream-data-send / response-read.
-- H3 response path now drains trailers via
-  `stream.recv_trailers().await` after the DATA-frame loop
-  before returning the buffered `Response`. Without this,
-  the response stream stays "unfinished" on the reused QUIC
-  connection — the first request succeeds, but the next
-  request on the same connection hangs until the mechanics
-  300 s timeout fires. Trailers themselves are discarded
-  (no API surface yet); reading them is what completes the
-  stream.
+- H3 response path treats DATA EOF as response-body
+  completion and does not wait for optional trailers. The
+  prior `stream.recv_trailers().await` call was added to
+  finish the response stream so a *reused* QUIC connection
+  stayed in a reusable state; with per-request connections
+  there's nothing to keep reusable, and waiting on trailers
+  the h3 stack may never resolve promptly turns a complete
+  response body into a stuck mechanics endpoint future. The
+  caller has no trailer API surface, so this is a pure
+  behaviour fix — no API change.
 
 ### Added
 - `RequestBuilder::body_streaming(body)` accepts any

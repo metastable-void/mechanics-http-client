@@ -1,6 +1,5 @@
 //! Opportunistic HTTP/3 over QUIC.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,7 +7,6 @@ use std::time::Duration;
 use bytes::{Buf, Bytes, BytesMut};
 use http::{Request, Response as HttpResponse};
 use quinn::crypto::rustls::QuicClientConfig;
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::client::Origin;
 use crate::error::Error;
@@ -22,10 +20,9 @@ const H3_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const H3_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const H3_STREAM_OPEN_TIMEOUT: Duration = Duration::from_millis(150);
 
-/// Cached HTTP/3 transport state owned by a [`Client`](crate::Client).
+/// HTTP/3 endpoint state owned by a [`Client`](crate::Client).
 pub(crate) struct Http3State {
     endpoint: Mutex<Option<quinn::Endpoint>>,
-    connections: Mutex<HashMap<Origin, Arc<AsyncMutex<H3SendRequest>>>>,
 }
 
 pub(crate) enum Http3AttemptError {
@@ -40,7 +37,6 @@ impl Http3State {
     pub(crate) fn new() -> Self {
         Self {
             endpoint: Mutex::new(None),
-            connections: Mutex::new(HashMap::new()),
         }
     }
 
@@ -52,29 +48,26 @@ impl Http3State {
         request: Request<()>,
         body: Option<Bytes>,
     ) -> std::result::Result<Response, Http3AttemptError> {
-        let sender = match self
-            .connection(origin.clone(), authority_host, addresses)
+        let mut sender = match self
+            .connection(authority_host, origin.port, addresses)
             .await
         {
             Ok(sender) => sender,
             Err(err) => return Err(Http3AttemptError::Handshake(err)),
         };
 
-        let mut stream = tokio::time::timeout(H3_STREAM_OPEN_TIMEOUT, async {
-            let mut sender = sender.lock().await;
-            sender.send_request(request).await
-        })
-        .await
-        .map_err(|_| Http3AttemptError::Stream {
-            error: Error::Cancelled(format!(
-                "HTTP/3 request stream open timed out after {H3_STREAM_OPEN_TIMEOUT:?}"
-            )),
-            retry_without_h3: true,
-        })?
-        .map_err(|e| Http3AttemptError::Stream {
-            error: Error::Cancelled(e.to_string()),
-            retry_without_h3: true,
-        })?;
+        let mut stream = tokio::time::timeout(H3_STREAM_OPEN_TIMEOUT, sender.send_request(request))
+            .await
+            .map_err(|_| Http3AttemptError::Stream {
+                error: Error::Cancelled(format!(
+                    "HTTP/3 request stream open timed out after {H3_STREAM_OPEN_TIMEOUT:?}"
+                )),
+                retry_without_h3: true,
+            })?
+            .map_err(|e| Http3AttemptError::Stream {
+                error: Error::Cancelled(e.to_string()),
+                retry_without_h3: true,
+            })?;
 
         if let Some(body) = body {
             stream
@@ -102,11 +95,6 @@ impl Http3State {
             let remaining = chunk.remaining();
             body.extend_from_slice(&chunk.copy_to_bytes(remaining));
         }
-        let _trailers = stream
-            .recv_trailers()
-            .await
-            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
-
         Ok(Response::new_buffered(HttpResponse::from_parts(
             parts,
             body.freeze(),
@@ -115,18 +103,12 @@ impl Http3State {
 
     async fn connection(
         &self,
-        origin: Origin,
         authority_host: &str,
+        port: u16,
         addresses: &[IpAddr],
-    ) -> std::result::Result<Arc<AsyncMutex<H3SendRequest>>, String> {
-        if let Ok(guard) = self.connections.lock()
-            && let Some(connection) = guard.get(&origin).cloned()
-        {
-            return Ok(connection);
-        }
-
+    ) -> std::result::Result<H3SendRequest, String> {
         let endpoint = self.endpoint()?;
-        let addr = first_socket_addr(authority_host, origin.port, addresses).await?;
+        let addr = first_socket_addr(authority_host, port, addresses).await?;
         let connecting = endpoint
             .connect(addr, authority_host)
             .map_err(|e| e.to_string())?;
@@ -144,17 +126,7 @@ impl Http3State {
             let _ = driver.wait_idle().await;
         });
 
-        let send_request = Arc::new(AsyncMutex::new(send_request));
-        if let Ok(mut guard) = self.connections.lock() {
-            guard.insert(origin, send_request.clone());
-        }
         Ok(send_request)
-    }
-
-    pub(crate) fn remove_connection(&self, origin: &Origin) {
-        if let Ok(mut guard) = self.connections.lock() {
-            guard.remove(origin);
-        }
     }
 
     fn endpoint(&self) -> std::result::Result<quinn::Endpoint, String> {
