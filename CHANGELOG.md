@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed
+- HTTP/3 attempts now negative-cache an origin when the in-flight
+  attempt future is cancelled or dropped before it can return. This
+  covers outer endpoint timeouts that abort a long-running H3 request
+  while it is still waiting for response headers: the timed-out request
+  still fails, but later requests from the same client skip H3 for the
+  negative-cache window instead of re-entering the same stale route.
+- HTTP/3 negative-cache insertion now also removes any cached
+  `Alt-Svc` entry for that origin. A service that disables H3 after
+  previously advertising it should not be retried via the old
+  `Alt-Svc` route every time the shorter negative-cache window expires.
+
 ### Changed
 - DNS resolution now goes through the shared `mechanics-dns`
   crate for TCP/TLS connection resolution, HTTP/3 fallback

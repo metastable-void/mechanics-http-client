@@ -343,7 +343,8 @@ async fn request_http3_with_stale_retry(
     now: Instant,
 ) -> Result<Option<Response>> {
     for attempt in 0..2 {
-        match client
+        let mut cancellation_guard = H3AttemptCancellationGuard::new(client, target.origin);
+        let result = client
             .inner
             .http3
             .request(
@@ -354,8 +355,10 @@ async fn request_http3_with_stale_retry(
                 request.clone(),
                 body.clone(),
             )
-            .await
-        {
+            .await;
+        cancellation_guard.disarm();
+
+        match result {
             Ok(response) => return Ok(Some(response)),
             Err(http3::Http3AttemptError::Handshake(message)) => {
                 let _ = message;
@@ -380,6 +383,37 @@ async fn request_http3_with_stale_retry(
 
     insert_negative(client, target.origin.clone(), now);
     Ok(None)
+}
+
+#[cfg(feature = "http3")]
+struct H3AttemptCancellationGuard<'a> {
+    client: &'a Client,
+    origin: &'a Origin,
+    armed: bool,
+}
+
+#[cfg(feature = "http3")]
+impl<'a> H3AttemptCancellationGuard<'a> {
+    fn new(client: &'a Client, origin: &'a Origin) -> Self {
+        Self {
+            client,
+            origin,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "http3")]
+impl Drop for H3AttemptCancellationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            insert_negative(self.client, self.origin.clone(), Instant::now());
+        }
+    }
 }
 
 #[cfg(feature = "http3")]
@@ -447,7 +481,13 @@ fn negative_cache_hit(client: &Client, origin: &Origin, now: Instant) -> bool {
 #[cfg(feature = "http3")]
 fn insert_negative(client: &Client, origin: Origin, now: Instant) {
     if let Ok(mut cache) = client.inner.negative_cache.write() {
-        cache.insert(origin, now + client.inner.http3_negative_cache_duration);
+        cache.insert(
+            origin.clone(),
+            now + client.inner.http3_negative_cache_duration,
+        );
+    }
+    if let Ok(mut cache) = client.inner.alt_svc_cache.write() {
+        cache.remove(&origin);
     }
 }
 
@@ -486,5 +526,51 @@ fn map_legacy_error(err: hyper_util::client::legacy::Error) -> Error {
         Error::Tls(message)
     } else {
         Error::Internal(message)
+    }
+}
+
+#[cfg(all(feature = "http3", test))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h3_attempt_cancellation_guard_negative_caches_on_drop() {
+        let client = Client::builder().build().expect("client");
+        let origin = Origin {
+            host: "example.com".to_owned(),
+            port: 443,
+        };
+        client.insert_alt_svc_for_test(
+            origin.clone(),
+            alt_svc::AltSvcEntry {
+                host: None,
+                port: 443,
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        assert!(client.has_alt_svc_for_test(&origin));
+
+        {
+            let _guard = H3AttemptCancellationGuard::new(&client, &origin);
+        }
+
+        assert!(client.has_negative_for_test(&origin));
+        assert!(!client.has_alt_svc_for_test(&origin));
+    }
+
+    #[test]
+    fn h3_attempt_cancellation_guard_disarms_after_completion() {
+        let client = Client::builder().build().expect("client");
+        let origin = Origin {
+            host: "example.com".to_owned(),
+            port: 443,
+        };
+
+        {
+            let mut guard = H3AttemptCancellationGuard::new(&client, &origin);
+            guard.disarm();
+        }
+
+        assert!(!client.has_negative_for_test(&origin));
     }
 }
