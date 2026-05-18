@@ -39,6 +39,7 @@ default = ["http3"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "rt-multi-thread"] }
 wiremock = { version = "0.6", default-features = false, features = [] }
 

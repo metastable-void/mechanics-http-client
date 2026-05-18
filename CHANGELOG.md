@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Fixed
+- HTTP/3 streamed response bodies now retain the underlying
+  `h3::client::SendRequest` owner until the body is fully consumed
+  or dropped. The h3 crate closes the QUIC/H3 connection with
+  `H3_NO_ERROR` and reason `"Connection closed by client"` when the
+  last `SendRequest` is dropped; after the response-streaming change,
+  `mechanics-http-client` was dropping that owner as soon as response
+  headers arrived, so later body reads could fail on a locally closed
+  connection.
 - HTTP/3 attempts now negative-cache an origin when the in-flight
   attempt future is cancelled or dropped before it can return. This
   covers outer endpoint timeouts that abort a long-running H3 request

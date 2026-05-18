@@ -97,7 +97,7 @@ impl Http3State {
         let (parts, ()) = response.into_parts();
         Ok(Response::new_h3(
             HttpResponse::from_parts(parts, ()),
-            H3ResponseBody::new(stream),
+            H3ResponseBody::new(stream, sender),
         ))
     }
 
@@ -155,6 +155,7 @@ impl Http3State {
 /// Streaming HTTP/3 response body backed by an h3 client request stream.
 pub(crate) struct H3ResponseBody {
     state: H3ResponseBodyState,
+    _sender: H3SendRequest,
 }
 
 enum H3ResponseBodyState {
@@ -170,9 +171,10 @@ impl std::fmt::Debug for H3ResponseBody {
 }
 
 impl H3ResponseBody {
-    fn new(stream: H3RequestStream) -> Self {
+    fn new(stream: H3RequestStream, sender: H3SendRequest) -> Self {
         Self {
             state: H3ResponseBodyState::Ready(Some(Box::new(stream))),
+            _sender: sender,
         }
     }
 }
@@ -286,4 +288,189 @@ fn h3_transport_config() -> std::result::Result<quinn::TransportConfig, String> 
             H3_MAX_IDLE_TIMEOUT.try_into().map_err(|e| format!("{e}"))?,
         ));
     Ok(transport)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Buf;
+    use http::{Method, Request, Response as HttpResponse, StatusCode};
+    use http_body_util::BodyExt;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h3_response_body_keeps_connection_owner_until_body_drop() {
+        let fixture = H3Fixture::start().await;
+        let mut send_request = connect_h3_client(fixture.addr, fixture.cert.clone()).await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://localhost/test")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(request).await.unwrap();
+        stream.finish().await.unwrap();
+
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = H3ResponseBody::new(stream, send_request);
+        let mut out = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            if let Ok(mut data) = frame.into_data() {
+                let remaining = data.remaining();
+                out.extend_from_slice(&data.copy_to_bytes(remaining));
+            }
+        }
+
+        assert_eq!(out, b"hello from h3");
+        drop(body);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_h3_send_request_before_body_reproduces_client_close() {
+        let fixture = H3Fixture::start().await;
+        let mut send_request = connect_h3_client(fixture.addr, fixture.cert.clone()).await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://localhost/test")
+            .body(())
+            .unwrap();
+        let mut stream = send_request.send_request(request).await.unwrap();
+        stream.finish().await.unwrap();
+
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        drop(send_request);
+        let err = match stream.recv_data().await {
+            Err(err) => err,
+            Ok(_) => panic!("expected H3 body read to fail after dropping SendRequest"),
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("Connection closed by client") || message.contains("H3_NO_ERROR"),
+            "unexpected H3 error after dropping SendRequest: {message}"
+        );
+
+        fixture.shutdown().await;
+    }
+
+    struct H3Fixture {
+        endpoint: quinn::Endpoint,
+        addr: SocketAddr,
+        cert: CertificateDer<'static>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl H3Fixture {
+        async fn start() -> Self {
+            let (cert_chain, key) = test_tls_material();
+            let cert = cert_chain[0].clone();
+            let endpoint = quinn::Endpoint::server(
+                test_server_config(cert_chain, key),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
+            let addr = endpoint.local_addr().unwrap();
+            let task_endpoint = endpoint.clone();
+            let task = tokio::spawn(async move {
+                serve_single_delayed_body(task_endpoint).await;
+            });
+
+            Self {
+                endpoint,
+                addr,
+                cert,
+                task,
+            }
+        }
+
+        async fn shutdown(self) {
+            self.endpoint.close(0_u32.into(), b"test shutdown");
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.task).await;
+        }
+    }
+
+    async fn serve_single_delayed_body(endpoint: quinn::Endpoint) {
+        let incoming = endpoint.accept().await.unwrap();
+        let connecting = incoming.accept().unwrap();
+        let connection = connecting.await.unwrap();
+        let quic = h3_quinn::Connection::new(connection);
+        let mut h3_conn = h3::server::Connection::new(quic).await.unwrap();
+        let resolver = h3_conn.accept().await.unwrap().unwrap();
+        let (_request, mut stream) = resolver.resolve_request().await.unwrap();
+
+        stream
+            .send_response(HttpResponse::builder().status(200).body(()).unwrap())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if stream
+            .send_data(Bytes::from_static(b"hello from h3"))
+            .await
+            .is_ok()
+        {
+            let _ = stream.finish().await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), h3_conn.accept()).await;
+    }
+
+    async fn connect_h3_client(addr: SocketAddr, cert: CertificateDer<'static>) -> H3SendRequest {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).unwrap();
+        let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+        let mut endpoint =
+            quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let quic = h3_quinn::Connection::new(connection);
+        let (mut driver, send_request) = h3::client::builder().build(quic).await.unwrap();
+        tokio::spawn(async move {
+            let _ = driver.wait_idle().await;
+            drop(endpoint);
+        });
+        send_request
+    }
+
+    fn test_tls_material() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let cert_chain = vec![cert.der().clone()];
+        let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        (cert_chain, key)
+    }
+
+    fn test_server_config(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> quinn::ServerConfig {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .unwrap();
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config).unwrap();
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+        server_config.transport_config(Arc::new(h3_transport_config().unwrap()));
+        server_config
+    }
 }
