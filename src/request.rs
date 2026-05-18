@@ -366,23 +366,35 @@ async fn request_http3_with_stale_retry(
                 return Ok(None);
             }
             Err(http3::Http3AttemptError::Stream {
-                error,
-                retry_without_h3,
-            }) => {
-                if retry_without_h3 && attempt == 0 {
-                    continue;
-                }
-                insert_negative(client, target.origin.clone(), now);
-                if retry_without_h3 {
+                retry_without_h3, ..
+            }) => match h3_stream_failure_action(retry_without_h3, attempt) {
+                H3StreamFailureAction::RetryFreshH3 => continue,
+                H3StreamFailureAction::UseTcp => {
+                    insert_negative(client, target.origin.clone(), now);
                     return Ok(None);
                 }
-                return Err(error);
-            }
+            },
         }
     }
 
     insert_negative(client, target.origin.clone(), now);
     Ok(None)
+}
+
+#[cfg(feature = "http3")]
+#[derive(Debug, Eq, PartialEq)]
+enum H3StreamFailureAction {
+    RetryFreshH3,
+    UseTcp,
+}
+
+#[cfg(feature = "http3")]
+fn h3_stream_failure_action(retry_without_h3: bool, attempt: usize) -> H3StreamFailureAction {
+    if retry_without_h3 && attempt == 0 {
+        H3StreamFailureAction::RetryFreshH3
+    } else {
+        H3StreamFailureAction::UseTcp
+    }
 }
 
 #[cfg(feature = "http3")]
@@ -572,5 +584,62 @@ mod tests {
         }
 
         assert!(!client.has_negative_for_test(&origin));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn h3_missing_udp_listener_falls_back_before_request_timeout() {
+        let blackhole = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind local UDP blackhole");
+        let port = blackhole.local_addr().expect("local addr").port();
+        let client = Client::builder().build().expect("client");
+        let origin = Origin {
+            host: "localhost".to_owned(),
+            port,
+        };
+        let target_origin = origin.clone();
+        let uri = format!("https://localhost:{port}/")
+            .parse()
+            .expect("test URI");
+        let request =
+            request_for_http3(Method::GET, uri, http::HeaderMap::new()).expect("h3 request");
+        let addresses = [std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)];
+        let target = Http3RequestTarget {
+            origin: &origin,
+            target: target_origin,
+            authority_host: "localhost",
+            addresses: &addresses,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            request_http3_with_stale_retry(&client, target, request, None, Instant::now()),
+        )
+        .await
+        .expect("missing H3 service must not inherit endpoint timeout")
+        .expect("H3 fallback result");
+
+        assert!(result.is_none());
+        assert!(client.has_negative_for_test(&origin));
+        drop(blackhole);
+    }
+
+    #[test]
+    fn h3_stream_failure_after_retry_budget_uses_tcp_fallback() {
+        assert_eq!(
+            h3_stream_failure_action(true, 0),
+            H3StreamFailureAction::RetryFreshH3
+        );
+        assert_eq!(
+            h3_stream_failure_action(true, 1),
+            H3StreamFailureAction::UseTcp
+        );
+    }
+
+    #[test]
+    fn h3_stream_failure_after_request_started_uses_tcp_fallback() {
+        assert_eq!(
+            h3_stream_failure_action(false, 0),
+            H3StreamFailureAction::UseTcp
+        );
     }
 }

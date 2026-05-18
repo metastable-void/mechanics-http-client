@@ -37,10 +37,7 @@ pub(crate) struct Http3State {
 
 pub(crate) enum Http3AttemptError {
     Handshake(String),
-    Stream {
-        error: Error,
-        retry_without_h3: bool,
-    },
+    Stream { retry_without_h3: bool },
 }
 
 impl Http3State {
@@ -70,30 +67,21 @@ impl Http3State {
         let mut stream = tokio::time::timeout(H3_STREAM_OPEN_TIMEOUT, sender.send_request(request))
             .await
             .map_err(|_| Http3AttemptError::Stream {
-                error: Error::Cancelled(format!(
-                    "HTTP/3 request stream open timed out after {H3_STREAM_OPEN_TIMEOUT:?}"
-                )),
                 retry_without_h3: true,
             })?
-            .map_err(|e| Http3AttemptError::Stream {
-                error: Error::Cancelled(e.to_string()),
+            .map_err(|_| Http3AttemptError::Stream {
                 retry_without_h3: true,
             })?;
 
         if let Some(body) = body {
-            h3_stream_phase(
-                H3_STREAM_UPLOAD_TIMEOUT,
-                "request body send",
-                stream.send_data(body),
-            )
-            .await?;
+            h3_stream_phase(H3_STREAM_UPLOAD_TIMEOUT, stream.send_data(body)).await?;
         }
-        h3_stream_phase(H3_STREAM_UPLOAD_TIMEOUT, "request finish", stream.finish()).await?;
+        h3_stream_phase(H3_STREAM_UPLOAD_TIMEOUT, stream.finish()).await?;
 
         let response = stream
             .recv_response()
             .await
-            .map_err(|e| stream_error_after_request_started(Error::Cancelled(e.to_string())))?;
+            .map_err(|_| stream_error_after_request_started())?;
         let (parts, ()) = response.into_parts();
         Ok(Response::new_h3(
             HttpResponse::from_parts(parts, ()),
@@ -179,6 +167,14 @@ impl H3ResponseBody {
     }
 }
 
+impl Drop for H3ResponseBody {
+    fn drop(&mut self) {
+        if let H3ResponseBodyState::Ready(Some(stream)) = &mut self.state {
+            cancel_request_stream(stream);
+        }
+    }
+}
+
 impl http_body::Body for H3ResponseBody {
     type Data = Bytes;
     type Error = Error;
@@ -232,6 +228,11 @@ impl http_body::Body for H3ResponseBody {
     }
 }
 
+fn cancel_request_stream(stream: &mut H3RequestStream) {
+    stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
+    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+}
+
 async fn first_socket_addr(
     resolver: &Resolver,
     host: &str,
@@ -257,7 +258,6 @@ async fn first_socket_addr(
 
 async fn h3_stream_phase<T, E>(
     timeout: Duration,
-    phase: &'static str,
     future: impl Future<Output = std::result::Result<T, E>>,
 ) -> std::result::Result<T, Http3AttemptError>
 where
@@ -265,17 +265,12 @@ where
 {
     tokio::time::timeout(timeout, future)
         .await
-        .map_err(|_| stream_error_after_request_started(Error::Timeout))?
-        .map_err(|e| {
-            stream_error_after_request_started(Error::Cancelled(format!(
-                "HTTP/3 {phase} failed: {e}"
-            )))
-        })
+        .map_err(|_| stream_error_after_request_started())?
+        .map_err(|_| stream_error_after_request_started())
 }
 
-fn stream_error_after_request_started(error: Error) -> Http3AttemptError {
+fn stream_error_after_request_started() -> Http3AttemptError {
     Http3AttemptError::Stream {
-        error,
         retry_without_h3: false,
     }
 }

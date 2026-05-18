@@ -3,6 +3,20 @@
 ## [Unreleased]
 
 ### Fixed
+- Failed HTTP/3 stream attempts now negative-cache the origin and
+  fall back to the normal TCP/TLS stack instead of surfacing the H3
+  failure as the terminal request result. This includes H3 failures
+  after request bytes were sent, because this client only attempts H3
+  for empty or replayable byte bodies.
+- HTTP/3 connect, setup, stream-open, and upload phases remain
+  independently bounded before TCP/TLS fallback. A deployment whose
+  DNS HTTPS RR still advertises `h3` while the server has
+  `bind_h3 = None` fails through the H3 probe path before the large
+  endpoint/request timeout is spent.
+- Established HTTP/3 requests keep waiting for response headers under
+  the caller's existing request timeout. This preserves long-running
+  H3 endpoints whose application work happens before headers are
+  emitted.
 - HTTP/3 streamed response bodies now retain the underlying
   `h3::client::SendRequest` owner until the body is fully consumed
   or dropped. The h3 crate closes the QUIC/H3 connection with
